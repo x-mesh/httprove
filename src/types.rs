@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// IP 패밀리 선택 (-4 / -6 플래그).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,10 @@ pub struct ProbeConfig {
     pub keep_alive: bool,
     /// 프로브 결과에 적용할 어설션. 위반은 ProbeResult.expect_failures에 기록된다.
     pub expect: Expectations,
+    /// --traceparent로 주입한 W3C trace-id(32 hex). OTLP export가 같은 trace-id를
+    /// 재사용해 헤더와 내보낸 스팬의 trace를 백엔드에서 상관시킬 수 있게 한다. None이면
+    /// traceparent 미사용(또는 export가 자체 trace-id를 만든다).
+    pub trace_id: Option<String>,
 }
 
 /// `--expect-*` 어설션 집합. 모두 None이면 검사 안 함.
@@ -142,7 +146,7 @@ impl WarnLevel {
 }
 
 /// 단계별 소요 시간 (밀리초). 해당 단계가 없으면 None (예: IP 직결 시 dns, http 시 tls).
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PhaseTimings {
     pub dns_ms: Option<f64>,
     pub tcp_ms: f64,
@@ -156,7 +160,7 @@ pub struct PhaseTimings {
 }
 
 /// TLS 협상 결과.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsInfo {
     /// 예: "TLSv1.3"
     pub version: String,
@@ -169,7 +173,7 @@ pub struct TlsInfo {
 }
 
 /// X.509 인증서 요약 (체인의 각 인증서마다 하나).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertInfo {
     pub subject: String,
     pub issuer: String,
@@ -186,10 +190,19 @@ pub struct CertInfo {
     /// 공개키 요약, 예: "RSA 2048" / "EC P-256"
     pub pubkey: String,
     pub is_ca: bool,
+    /// SubjectPublicKeyInfo의 SHA-256 (소문자 hex). 키 핀/지문 비교용.
+    /// 직렬화 키는 "spki_sha256". 역직렬화 시 누락되면 빈 문자열.
+    #[serde(default)]
+    pub spki_sha256: String,
+    /// Authority Information Access의 caIssuers URL (있으면). leaf 인증서에서 파싱 시점에
+    /// 추출해, --check-chain이 DER 재보유 없이 AIA 복구 가능성을 조회하는 데 쓴다.
+    /// 직렬화 키는 "aia_ca_issuers". 역직렬화 시 누락되면 None.
+    #[serde(default)]
+    pub aia_ca_issuers: Option<String>,
 }
 
 /// 리다이렉트 체인의 한 hop (= 한 번의 연결 + 요청/응답).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HopResult {
     pub url: String,
     /// 실제 연결에 사용한 IP.
@@ -217,7 +230,7 @@ pub struct HopResult {
 }
 
 /// 프로브 실패가 발생한 단계.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorPhase {
     Setup,
@@ -245,16 +258,20 @@ impl std::fmt::Display for ErrorPhase {
 }
 
 /// 프로브 실패 정보.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeError {
     pub phase: ErrorPhase,
     pub message: String,
     /// 타임아웃으로 인한 실패 여부.
     pub timed_out: bool,
+    /// 사람이 읽을 진단 힌트 + 한 줄 해법 (핸드셰이크 디코더 등이 채운다).
+    /// 직렬화 키는 "hint". 역직렬화 시 누락되면 None.
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
 /// 프로브 1회의 결과. 실패하더라도 완료된 hop들은 hops에 보존된다.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResult {
     /// 이 결과가 속한 대상 (ProbeConfig.url 문자열). 멀티 타깃 구분용.
     pub target: String,
@@ -315,4 +332,77 @@ impl ProbeResult {
         }
         sum
     }
+}
+
+// ===========================================================================
+// v0.2 진단 확장용 공유 타입 (모두 ProbeResult 등에서 on-demand 계산; 저장 X)
+// ===========================================================================
+
+/// 서비스 건강 판정 상태. 색상/심각도 정렬에 사용.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerdictState {
+    /// 모든 신호 정상.
+    Pass,
+    /// 일부 단계/어설션이 임계 초과 또는 경고 수준.
+    Degraded,
+    /// 네트워크 실패 등으로 서비스에 도달 불가.
+    Down,
+}
+
+impl VerdictState {
+    pub fn label(self) -> &'static str {
+        match self {
+            VerdictState::Pass => "PASS",
+            VerdictState::Degraded => "DEGRADED",
+            VerdictState::Down => "DOWN",
+        }
+    }
+}
+
+/// 한 프로브(또는 요약)에 대한 건강 판정. `verdict` 모듈이 생성한다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Verdict {
+    pub state: VerdictState,
+    /// 한 줄 헤드라인 (예: "TTFB p95 412ms (baseline 90ms, +358%)").
+    pub headline: String,
+    /// 판정을 뒷받침하는 근거들 (단계별 편차, 어설션 위반, cert 경고 등).
+    pub reasons: Vec<String>,
+}
+
+/// 인증서 체인 분석 (완결성 + 최약 링크 만료 + AIA 복구 가능성).
+/// `cert` 모듈이 `Vec<CertInfo>`(+선택적 AIA 네트워크 조회)로 생성한다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChainAnalysis {
+    /// 서버가 leaf만 보내 체인이 끊겼는지 (중간 인증서 누락).
+    pub incomplete: bool,
+    /// AIA caIssuers로 체인을 재구성할 수 있는지 (--check-chain 시에만 Some).
+    pub aia_repairable: Option<bool>,
+    /// 체인 전체에서 가장 빨리 만료되는 인증서의 잔여 일수 (최약 링크).
+    pub weakest_days: i64,
+    /// 최약 링크 인증서의 subject CN (어느 cert가 먼저 죽는지).
+    pub weakest_subject: String,
+    /// 사람이 읽을 이슈 목록 ("intermediate missing", "root expires before leaf" 등).
+    pub issues: Vec<String>,
+}
+
+/// 서비스 신원 지문 — 변경 탐지(⑤)용. 같은 호스트의 두 시점/두 엔드포인트 비교.
+/// `diff` 모듈이 ProbeResult에서 추출한다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Fingerprint {
+    /// 최종 hop 연결 IP + DNS가 반환한 전체 IP 집합 (정렬된 문자열).
+    pub resolved_ips: Vec<String>,
+    pub connected_ip: Option<String>,
+    pub http_version: Option<String>,
+    pub status: Option<u16>,
+    pub tls_version: Option<String>,
+    pub alpn: Option<String>,
+    /// leaf 인증서 시리얼.
+    pub cert_serial: Option<String>,
+    /// leaf SPKI SHA-256 (키 핀).
+    pub cert_spki: Option<String>,
+    /// leaf 만료일 (YYYY-MM-DD).
+    pub cert_not_after: Option<String>,
+    /// 식별성 있는 응답 헤더 일부 (server, content-type 등).
+    pub headers: Vec<(String, String)>,
 }

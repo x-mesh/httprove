@@ -279,6 +279,7 @@ mod tests {
             phase: ErrorPhase::Tcp,
             message: "connection refused".to_string(),
             timed_out: false,
+            hint: None,
         });
         p
     }
@@ -296,6 +297,8 @@ mod tests {
             sig_alg: "ECDSA-SHA256".to_string(),
             pubkey: "EC P-256".to_string(),
             is_ca: false,
+            spki_sha256: String::new(),
+            aia_ca_issuers: None,
         }
     }
 

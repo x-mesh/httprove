@@ -129,6 +129,13 @@ pub fn print_single(result: &ProbeResult, cfg: &OutputConfig) {
         let line = format!("{tag}ERROR({}): {}{}", err.phase, err.message, timeout_note);
         println!("{}", paint(&line, cfg.color, |s| s.red().bold()));
 
+        // 디코딩된 진단 힌트(있으면) — 기본 출력에서도 원인+해법을 노출한다
+        // (예: expired/wrong.host/untrusted-root 핸드셰이크 실패).
+        if let Some(hint) = &err.hint {
+            let hint_line = format!("hint: {hint}");
+            println!("{}", paint(&hint_line, cfg.color, |s| s.dimmed()));
+        }
+
         // 실패 전까지 완료된 hop이 있으면 표시.
         if !result.hops.is_empty() {
             println!();
@@ -441,6 +448,20 @@ fn print_cert_block(result: &ProbeResult, leaf: &CertInfo, cfg: &OutputConfig) {
                 c.days_remaining,
                 if c.is_ca { ", CA" } else { "" },
             );
+        }
+    }
+
+    // ㉒/㉑ 체인 분석: 최약 링크 만료 + 완결성/이슈. leaf가 속한 최종 https hop의
+    // 체인(len>=1)이 있으면 chain::analyze 결과를 덧붙인다.
+    if let Some(chain_hop) = result.hops.iter().rev().find(|h| !h.cert_chain.is_empty()) {
+        let analysis = crate::chain::analyze(&chain_hop.cert_chain);
+        println!(
+            "  weakest:  {} ({}d)",
+            analysis.weakest_subject, analysis.weakest_days
+        );
+        for issue in &analysis.issues {
+            let line = format!("  ! {issue}");
+            println!("{}", paint(&line, cfg.color, |s| s.yellow()));
         }
     }
 }

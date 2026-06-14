@@ -1,6 +1,7 @@
 //! CLI 출력 (텍스트 / JSON / Prometheus / 베이스라인).
 
 pub mod baseline;
+pub mod html;
 pub mod json;
 pub mod prom;
 pub mod text;

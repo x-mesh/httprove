@@ -205,6 +205,50 @@ httprove -c 10 --json https://api.example.com | jq 'select(.type=="probe") | .to
 - 프로브 1건당 한 줄: `{"type":"probe","seq":0,"hops":[{"timings":{...},"cert_chain":[...],...}],...}`
 - 마지막에 요약 한 줄: `{"type":"summary","phases":{"ttfb":{"p95":...},...},"status_counts":{"200":10},...}`
 
+## 심층 진단 (숫자를 결론으로)
+
+숫자를 보여주는 데서 그치지 않고 "어디가·왜 문제인지"를 판정한다.
+
+### 건강 판정 + 평문 설명
+
+```bash
+httprove --verdict https://api.example.com   # 끝에 PASS/DEGRADED/DOWN + 근거 한 줄
+httprove --explain https://api.example.com   # "TCP 39ms, 서버 21ms(TTFB), 총 60ms over HTTP/2"
+```
+
+종료 코드는 PASS=0 / DOWN=1로 합성 모니터링에 바로 쓴다.
+
+### 백엔드·경로 국소화
+
+```bash
+httprove --fanout https://api.example.com          # DNS의 모든 IP를 개별 프로브, 불량 백엔드(outlier) 적발
+httprove --all-families https://api.example.com    # IPv4 vs IPv6 단계별 비교
+httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # 리졸버별 응답 IP/POP 비교 (--ecs로 client-subnet)
+httprove trace https://api.example.com             # 시스템 traceroute + TLS 종단 hop 주석
+```
+
+### TLS 신뢰 심화
+
+```bash
+httprove --check-chain https://api.example.com   # 중간 인증서 누락 + AIA 복구 가능 여부
+httprove https://expired.example.com             # 핸드셰이크 실패를 원인+해법으로 번역 (hint:)
+```
+
+`--check-chain`은 "브라우저는 되는데 curl/Go는 실패"하는 미완 체인을 잡아낸다.
+인증서 블록은 항상 체인 전체의 최약 링크 만료일(`weakest:`)을 표시한다.
+
+### 변경 추적 · 캡처 · 연동
+
+```bash
+httprove https://x --json > before.json          # 두 시점/엔드포인트 비교
+httprove diff before.json after.json             # 바뀐 필드만 (cert serial, IP set, TLS, 헤더…)
+httprove --since-good /var/lib/httprove/x.state https://x   # 마지막 정상 대비 지문 변경 시 비-0
+httprove --trap -c 0 https://x                   # 첫 실패에서 동결, 전체 트랜잭션 덤프
+httprove --record sess.json -c 100 https://x && httprove replay sess.json   # 인시던트 기록/재생
+httprove --report out.html https://x             # 공유용 단일 HTML 리포트
+httprove --otlp http://collector:4318 --traceparent https://x   # OTLP span 내보내기 + traceparent 주입
+```
+
 ## 활용 시나리오
 
 - **"서비스가 느린데 어디가 느린지 모르겠다"** → 단발 워터폴로 DNS/네트워크/서버 중 병목 식별

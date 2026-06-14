@@ -296,6 +296,7 @@ mod tests {
             phase: ErrorPhase::Tcp,
             message: "connection refused".to_string(),
             timed_out: false,
+            hint: None,
         });
         p
     }

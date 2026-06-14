@@ -66,7 +66,34 @@ fn build_cert_info(cert: &X509Certificate<'_>) -> CertInfo {
         sig_alg: sig_alg_name(&cert.signature_algorithm.algorithm),
         pubkey: pubkey_summary(cert),
         is_ca: cert.is_ca(),
+        // SubjectPublicKeyInfo(DER)의 SHA-256 (소문자 hex). 키 핀/지문 비교용.
+        spki_sha256: crate::hash::sha256_hex(cert.public_key().raw),
+        // AIA caIssuers URL (있으면) — DER을 따로 보관하지 않고도 체인 복구 조회가 가능하도록
+        // 파싱 시점에 추출해 둔다.
+        aia_ca_issuers: extract_ca_issuers_url(cert),
     }
+}
+
+/// Authority Information Access 확장에서 caIssuers(id-ad-caIssuers) URL을 추출한다.
+/// 여러 개면 첫 http/https URL을 반환한다. 없거나 확장이 없으면 None.
+fn extract_ca_issuers_url(cert: &X509Certificate<'_>) -> Option<String> {
+    // id-ad-caIssuers = 1.3.6.1.5.5.7.48.2.
+    let ca_issuers_oid = Oid::from(&[1, 3, 6, 1, 5, 5, 7, 48, 2]).ok()?;
+    for ext in cert.extensions() {
+        if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
+            for desc in aia.iter() {
+                if desc.access_method != ca_issuers_oid {
+                    continue;
+                }
+                if let GeneralName::URI(uri) = desc.access_location
+                    && (uri.starts_with("http://") || uri.starts_with("https://"))
+                {
+                    return Some(uri.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 만료까지 남은 일수. 음수 = 이미 만료.
@@ -92,6 +119,8 @@ fn unparseable_cert_info() -> CertInfo {
         sig_alg: String::new(),
         pubkey: String::new(),
         is_ca: false,
+        spki_sha256: String::new(),
+        aia_ca_issuers: None,
     }
 }
 

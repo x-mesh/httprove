@@ -143,6 +143,7 @@ pub async fn probe(cfg: &ProbeConfig, seq: u64) -> ProbeResult {
                         phase: ErrorPhase::Redirect,
                         message: format!("invalid redirect location {loc:?}: {e}"),
                         timed_out: false,
+                        hint: None,
                     });
                     break;
                 }
@@ -165,6 +166,7 @@ pub async fn probe(cfg: &ProbeConfig, seq: u64) -> ProbeResult {
                 phase: ErrorPhase::Redirect,
                 message: "too many redirects".to_string(),
                 timed_out: false,
+                hint: None,
             });
             break;
         }
@@ -175,6 +177,7 @@ pub async fn probe(cfg: &ProbeConfig, seq: u64) -> ProbeResult {
                     phase: ErrorPhase::Redirect,
                     message: format!("unsupported redirect scheme: {other}"),
                     timed_out: false,
+                    hint: None,
                 });
                 break;
             }
@@ -302,6 +305,8 @@ struct PhaseFail {
     phase: ErrorPhase,
     message: String,
     timed_out: bool,
+    /// 진단 힌트 (TLS 핸드셰이크 디코더 등이 채운다). 기본 None.
+    hint: Option<String>,
 }
 
 impl PhaseFail {
@@ -310,6 +315,7 @@ impl PhaseFail {
             phase,
             message,
             timed_out: false,
+            hint: None,
         }
     }
 
@@ -318,6 +324,7 @@ impl PhaseFail {
             phase: self.phase,
             message: self.message,
             timed_out: self.timed_out,
+            hint: self.hint,
         }
     }
 }
@@ -363,6 +370,7 @@ where
             phase,
             message: format!("timed out during {phase} phase"),
             timed_out: true,
+            hint: None,
         }),
     }
 }
@@ -477,9 +485,15 @@ async fn connect_hop(
     let tcp_start = Instant::now();
     let tcp_stream = phase_await(deadline, ErrorPhase::Tcp, async {
         TcpStream::connect((ip, port)).await.map_err(|e| {
+            // SocketAddr 포맷을 써서 IPv6를 [addr]:port로 올바르게 표기한다
+            // (그냥 {ip}:{port}면 "2001:...:::443"처럼 콜론이 겹친다).
             PhaseFail::new(
                 ErrorPhase::Tcp,
-                format!("connect to {ip}:{port} failed: {}", error_chain(&e)),
+                format!(
+                    "connect to {} failed: {}",
+                    SocketAddr::new(ip, port),
+                    error_chain(&e)
+                ),
             )
         })
     })
@@ -499,10 +513,12 @@ async fn connect_hop(
         let tls_start = Instant::now();
         let tls_stream = phase_await(deadline, ErrorPhase::Tls, async {
             connector.connect(sni, tcp_stream).await.map_err(|e| {
-                PhaseFail::new(
-                    ErrorPhase::Tls,
-                    format!("TLS handshake failed: {}", error_chain(&e)),
-                )
+                let message = format!("TLS handshake failed: {}", error_chain(&e));
+                // ㉑ 핸드셰이크 오류 디코더: 사람이 읽을 원인+해법을 hint로 채운다.
+                let hint = crate::chain::decode_tls_error(&message);
+                let mut fail = PhaseFail::new(ErrorPhase::Tls, message);
+                fail.hint = hint;
+                fail
             })
         })
         .await?;

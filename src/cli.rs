@@ -90,7 +90,11 @@ pub struct Args {
     pub json: bool,
 
     /// Live TUI dashboard (implies continuous probing unless -c is given)
-    #[arg(long)]
+    // TUI는 run_cli_mode 전에 반환하므로 후처리/판정/조사 플래그는 무시된다 — 거부한다.
+    #[arg(long, conflicts_with_all = [
+        "verdict", "explain", "check_chain", "record", "report", "on_change",
+        "otlp", "since_good", "annotate_deploy", "fanout", "all_families", "via",
+    ])]
     pub tui: bool,
 
     /// Print a Prometheus textfile-collector snapshot instead of the
@@ -100,13 +104,26 @@ pub struct Args {
 
     /// Exporter mode: probe forever and serve /metrics on this address
     /// (e.g. 0.0.0.0:9912)
+    // exporter는 자체 무한 루프로 run_cli_mode 전에 반환하므로 후처리/판정/조사 플래그를
+    // 무시한다 — 거부한다.
     #[arg(long, value_name = "ADDR",
-          conflicts_with_all = ["tui", "json", "prom", "save", "compare", "cert_check", "count"])]
+          conflicts_with_all = [
+              "tui", "json", "prom", "save", "compare", "cert_check", "count",
+              "verdict", "explain", "check_chain", "trap", "record", "report",
+              "on_change", "otlp", "since_good", "annotate_deploy",
+              "fanout", "all_families", "via",
+          ])]
     pub listen: Option<SocketAddr>,
 
     /// Batch certificate expiry check for the given targets
+    // cert-check은 run() 최상단에서 반환하므로 프로브 후처리/판정/조사 플래그를 무시한다.
     #[arg(long = "cert-check",
-          conflicts_with_all = ["tui", "follow", "keepalive", "save", "compare", "prom"])]
+          conflicts_with_all = [
+              "tui", "follow", "keepalive", "save", "compare", "prom",
+              "verdict", "explain", "check_chain", "trap", "record", "report",
+              "on_change", "otlp", "traceparent", "since_good", "annotate_deploy",
+              "fanout", "all_families", "via",
+          ])]
     pub cert_check: bool,
 
     /// Save run statistics to a baseline file (JSON)
@@ -154,6 +171,89 @@ pub struct Args {
     /// Disable colored output
     #[arg(long)]
     pub no_color: bool,
+
+    // === v0.2 진단 확장 플래그 ============================================
+    // 출력 부가 신호 (단발/요약 흐름에 덧붙는다).
+    /// Append a PASS/DEGRADED/DOWN health verdict after each probe/summary
+    #[arg(long)]
+    pub verdict: bool,
+
+    /// Print a plain-language explanation of each probe result
+    #[arg(long)]
+    pub explain: bool,
+
+    // 조사(investigation) 모드 — 단발성, 자체 종료 코드 (standalone-ish).
+    // 이 모드들은 자체 출력/종료 코드로 일찍 반환하므로, 후처리/판정 플래그를 함께 주면
+    // 조용히 무시된다 — clap 단에서 거부해 사용자가 no-op 조합을 만들지 않게 한다.
+    /// Probe every resolved A/AAAA address individually and flag outliers
+    #[arg(long, conflicts_with_all = [
+        "verdict", "explain", "check_chain", "trap", "record", "report",
+        "on_change", "otlp", "since_good", "annotate_deploy", "all_families", "via",
+    ])]
+    pub fanout: bool,
+
+    /// Probe once forced IPv4 and once forced IPv6, comparing each phase
+    #[arg(long = "all-families", conflicts_with_all = [
+        "verdict", "explain", "check_chain", "trap", "record", "report",
+        "on_change", "otlp", "since_good", "annotate_deploy", "via",
+    ])]
+    pub all_families: bool,
+
+    /// Resolve via these DNS servers (comma-separated IPs) and compare POPs
+    #[arg(long, value_name = "IPS", conflicts_with_all = [
+        "verdict", "explain", "check_chain", "trap", "record", "report",
+        "on_change", "otlp", "since_good", "annotate_deploy",
+    ])]
+    pub via: Option<String>,
+
+    /// EDNS client-subnet for --via (e.g. "203.0.113.0/24")
+    #[arg(long, value_name = "CIDR")]
+    pub ecs: Option<String>,
+
+    // 인증서 체인 심화.
+    /// Analyze chain completeness and attempt AIA repair
+    #[arg(long = "check-chain")]
+    pub check_chain: bool,
+
+    // 캡처/기록/리포트.
+    /// Capture trap: probe until the first failure, then save the session
+    // 트랩은 record/report/otlp는 존중하지만(캡처 결과에 적용), 판정/변경탐지 플래그는
+    // 자체 흐름에서 무시하므로 그것들과는 충돌시킨다. tui/json/listen과도 출력 모드가 다르다.
+    #[arg(long, conflicts_with_all = [
+        "verdict", "explain", "check_chain", "on_change", "since_good",
+        "annotate_deploy", "tui", "json", "listen",
+    ])]
+    pub trap: bool,
+
+    /// Record every probe of this run to a session file (JSON)
+    #[arg(long, value_name = "PATH")]
+    pub record: Option<String>,
+
+    /// Write a self-contained HTML report to this path
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<String>,
+
+    /// Exit non-zero only when the service fingerprint changed (with --since-good)
+    #[arg(long = "on-change")]
+    pub on_change: bool,
+
+    // 텔레메트리.
+    /// Export each probe as OTLP/HTTP traces to this collector endpoint
+    #[arg(long, value_name = "ENDPOINT")]
+    pub otlp: Option<String>,
+
+    /// Emit a W3C traceparent header on each request
+    #[arg(long)]
+    pub traceparent: bool,
+
+    // 변경 탐지 / 배포 주석.
+    /// Annotate fingerprint change vs this saved probe (deploy verification)
+    #[arg(long = "annotate-deploy", value_name = "PATH")]
+    pub annotate_deploy: Option<String>,
+
+    /// Compare against this last-known-good probe JSON
+    #[arg(long = "since-good", value_name = "PATH")]
+    pub since_good: Option<String>,
 }
 
 impl Args {
@@ -217,7 +317,9 @@ impl Args {
                 timeout: Duration::from_secs_f64(self.timeout),
                 resolve: self.resolve,
                 ip_family,
-                insecure: self.insecure,
+                // --check-chain은 검증 실패(UnknownIssuer 등)로 핸드셰이크가 끊겨도 체인을
+                // 수집해 분석해야 하므로 무검증 핸드셰이크를 강제한다 (체인 진단 목적).
+                insecure: self.insecure || self.check_chain,
                 http_version: if self.http1 {
                     HttpVersionPref::Http1
                 } else {
@@ -226,6 +328,8 @@ impl Args {
                 max_redirects: if self.follow { self.max_redirects } else { 0 },
                 keep_alive: self.keepalive,
                 expect: expect.clone(),
+                // traceparent trace-id는 run()에서 --traceparent가 켜졌을 때 채운다.
+                trace_id: None,
             });
         }
         Ok(cfgs)
@@ -285,6 +389,29 @@ impl Args {
             max_total_ms: self.expect_total,
             min_cert_days: self.expect_cert_days,
         })
+    }
+
+    /// `--via` CSV(쉼표 구분 IP)를 IpAddr 목록으로 파싱한다 (dns::run_via_resolvers용).
+    /// --via가 없으면 빈 Vec. 빈 항목/공백은 건너뛰고, 잘못된 IP는 하드 에러.
+    pub fn parse_via_resolvers(&self) -> anyhow::Result<Vec<IpAddr>> {
+        let mut resolvers = Vec::new();
+        let Some(spec) = &self.via else {
+            return Ok(resolvers);
+        };
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let ip: IpAddr = part
+                .parse()
+                .with_context(|| format!("invalid --via resolver IP: {part}"))?;
+            resolvers.push(ip);
+        }
+        if resolvers.is_empty() {
+            bail!("--via has no valid resolver IPs: {spec}");
+        }
+        Ok(resolvers)
     }
 
     /// `--warn phase=ms` 목록을 WarnThresholds로 변환한다.
