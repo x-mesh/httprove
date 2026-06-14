@@ -17,6 +17,20 @@ Download               ▕▏   2.1 ms
 Total                     117.6 ms
 ```
 
+## 주요 기능
+
+- **단계별 워터폴** — DNS/TCP/TLS/TTFB/Download를 쪼개 병목 위치 식별
+- **TLS 심층 검사** — 버전/cipher/키교환, 체인 만료(최약링크)·SAN·발급자, 핸드셰이크 실패 원인 디코딩, 체인 완결성+AIA 복구
+- **건강 판정** — `--verdict`로 PASS/DEGRADED/DOWN + 근거 한 줄, `--explain` 평문 설명
+- **백엔드·경로 국소화** — `--fanout`(IP별), `--all-families`(v4/v6), `--via`(멀티 리졸버), `trace`(traceroute)
+- **변경 추적** — `diff`(두 캡처 비교), `--since-good`(마지막 정상 대비 지문 변경)
+- **지속 모니터링** — ping 모드 + 백분위 통계, 실시간 TUI 대시보드, 멀티 타깃
+- **합성 모니터링** — `--expect-*` 어설션(종료 코드 3), `--warn` 임계값 강조
+- **연동** — JSON/NDJSON, Prometheus(`--prom`/`--listen`), OTLP(`--otlp`), HTML 리포트(`--report`)
+- **캡처** — `--trap`(첫 실패 동결), `--record`/`replay`(인시던트 기록·재생)
+- **운영** — keep-alive 모드, `--resolve`, 인증서 일괄 점검(`--cert-check`), 베이스라인 비교
+- **두 명령** — `httprove`(정식)/`hpr`(단축), `httprove update`로 자가 업데이트
+
 ## 무엇을 측정하나
 
 매 프로브마다 **새 연결을 직접 수립**하여 각 단계를 실측한다 (커넥션 풀 재사용 없음 —
@@ -243,35 +257,60 @@ httprove https://expired.example.com             # 핸드셰이크 실패를 원
 httprove https://x --json > before.json          # 두 시점/엔드포인트 비교
 httprove diff before.json after.json             # 바뀐 필드만 (cert serial, IP set, TLS, 헤더…)
 httprove --since-good /var/lib/httprove/x.state https://x   # 마지막 정상 대비 지문 변경 시 비-0
+httprove --since-good x.state --on-change https://x         # CI: 지문이 바뀌면 비-0 종료 (배포 검증)
+httprove --annotate-deploy before.json https://x            # 저장된 프로브 대비 변경 주석
 httprove --trap -c 0 https://x                   # 첫 실패에서 동결, 전체 트랜잭션 덤프
 httprove --record sess.json -c 100 https://x && httprove replay sess.json   # 인시던트 기록/재생
 httprove --report out.html https://x             # 공유용 단일 HTML 리포트
 httprove --otlp http://collector:4318 --traceparent https://x   # OTLP span 내보내기 + traceparent 주입
 ```
 
+`--on-change`는 지문(cert·IP·TLS·헤더)이 직전 정상 상태와 달라지면 종료 코드를 비-0으로
+바꿔, 배포 후 "의도치 않은 변경"을 CI에서 잡는 데 쓴다.
+
 ## 활용 시나리오
 
-- **"서비스가 느린데 어디가 느린지 모르겠다"** → 단발 워터폴로 DNS/네트워크/서버 중 병목 식별
-- **배포 전후 레이턴시 비교** → `-c 30 --json` 두 번 돌려 p95 비교
-- **간헐적 타임아웃 추적** → `--tui` 또는 `-c 0`로 켜두고 실패 시점/단계 관찰
-- **인증서 만료 점검** → `--cert-warn`과 종료 코드로 cron 알람
-- **LB 뒤 특정 백엔드 점검** → `--resolve <ip>`로 노드별 직접 측정
+- **"서비스가 느린데 어디가 느린지 모르겠다"** → 단발 워터폴 + `--verdict`로 DNS/네트워크/서버 중 병목 판정
+- **"전부 느린가, 한 노드만 느린가"** → `--fanout`으로 백엔드 IP별 비교, 불량 노드 적발
+- **"무엇이 바뀌었나"** → `--since-good` 또는 `diff`로 cert/IP/TLS/헤더 변경 추적
+- **배포 전후 레이턴시 비교** → `--save`/`--compare`로 p50/p95 delta%
+- **간헐적 타임아웃 추적** → `--trap`으로 첫 실패 동결, 또는 `--tui`로 관찰
+- **인증서 만료/체인 점검** → `--cert-warn`·`--check-chain`·`--cert-check`로 cron 알람
+- **합성 모니터링** → `--expect-*`(exit 3) + `--otlp`로 트레이싱 백엔드 연동
+
+## 종료 코드
+
+| 코드 | 의미 |
+|:---:|------|
+| 0 | 모든 프로브 통과 (verdict PASS/DEGRADED) |
+| 1 | 네트워크 실패·실행 오류 (verdict DOWN), `--fanout`/`--cert-check` 등에서 결함 발견 |
+| 3 | 네트워크는 성공했으나 `--expect-*` 어설션 위반 |
 
 ## 구조
 
 ```
 src/
-├── lib.rs         # 모드 결정(단발/ping/TUI/exporter/cert-check), 시그널, 종료 코드
+├── lib.rs         # 진입점 cli_main: 서브커맨드/모드 라우팅, 시그널, 종료 코드
 ├── main.rs        # `httprove` 진입점 (lib::cli_main 호출)
-├── bin/hpr.rs     # `hpr` 진입점 (동일)
+├── bin/hpr.rs     # `hpr` 진입점 (동일 바이너리)
 ├── cli.rs         # clap 인자 → ProbeConfig / Expectations / WarnThresholds
-├── types.rs       # 공유 타입 (ProbeResult, PhaseTimings, CertInfo, …)
-├── probe.rs       # 핵심: 수동 DNS/TCP/TLS/HTTP 연결 + 단계별 실측, keepalive (rustls + hyper)
-├── cert.rs        # x509 체인 분석
+├── types.rs       # 공유 타입 (ProbeResult/CertInfo/Verdict/Fingerprint/ChainAnalysis, Serialize+Deserialize)
+├── probe.rs       # 핵심: 수동 DNS/TCP/TLS/HTTP 연결 + 단계별 실측, keepalive (rustls ring + hyper)
+├── cert.rs        # x509 체인 분석 (SPKI 핀 포함)
 ├── cert_check.rs  # --cert-check 일괄 점검
+├── hash.rs        # 공유 SHA-256 (의존성 없이; cert 핀·자가 업데이트 검증)
+├── verdict.rs     # 건강 판정 PASS/DEGRADED/DOWN (--verdict/--explain)
+├── diff.rs        # 지문 추출 + 프로브 JSON diff (diff 서브커맨드/--since-good)
+├── fanout.rs      # --fanout(IP별), --all-families(v4/v6)
+├── dns.rs         # 자체 DNS-over-UDP 클라이언트 (--via 멀티 리졸버 + --ecs)
+├── trace.rs       # 시스템 traceroute + TLS 종단 hop 주석
+├── chain.rs       # 체인 완결성/AIA 복구, 최약링크 만료, 핸드셰이크 에러 디코더
+├── record.rs      # --record/replay, --trap (첫 실패 동결)
+├── otlp.rs        # OTLP/HTTP span export, Server-Timing 파싱, traceparent
 ├── exporter.rs    # --listen Prometheus exporter
 ├── stats.rs       # Welford + 링버퍼 백분위
 ├── runner.rs      # 프로브 반복 루프 (멀티 타깃/간격/일시정지/취소)
-├── output/        # 텍스트(워터폴/ping/요약) + JSON + prom + baseline
+├── update/        # httprove update — 설치방식 감지 + 자가 교체
+├── output/        # 텍스트(워터폴/ping/요약) + JSON + prom + baseline + HTML 리포트
 └── tui/           # ratatui 대시보드 (멀티 타깃)
 ```
