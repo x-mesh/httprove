@@ -10,7 +10,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
   build:
+    needs: preflight
     name: build ${{ matrix.os_name }}_${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -52,6 +69,16 @@ jobs:
           name="httprove_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz"
           tar -czf "$name" -C "target/${{ matrix.target }}/release" httprove
           ( command -v sha256sum >/dev/null && sha256sum "$name" ) || shasum -a 256 "$name"
+          mkdir -p pkg-smoke
+          tar -xzf "$name" -C pkg-smoke
+          test -x pkg-smoke/httprove
+          test "$(tar -tzf "$name")" = "httprove"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${{ matrix.target }}" = "$host" ]; then
+            ./pkg-smoke/httprove --version
+            ./pkg-smoke/httprove --help >/dev/null
+            ./pkg-smoke/httprove update --help >/dev/null
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
