@@ -2,11 +2,18 @@
 
 > probe + prove your HTTP services.
 
-SRE를 위한 HTTP(S) 서비스 점검 도구. 요청의 모든 단계를 워터폴로 쪼개서 측정하고,
-TLS 인증서를 검사하며, ping처럼 지속적으로 프로브할 수 있다. CLI와 TUI를 모두 지원한다.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/x-mesh/httprove?sort=semver)](https://github.com/x-mesh/httprove/releases)
+[![Homebrew](https://img.shields.io/badge/homebrew-x--mesh%2Ftap-orange)](https://github.com/x-mesh/homebrew-tap)
 
-명령어는 두 가지 — 정식 명령 **`httprove`** 와 단축 명령 **`hpr`** (완전히 동일하다.
-이 문서의 모든 예시는 `hpr`로 바꿔 써도 된다).
+[한국어](README.ko.md) · **English**
+
+An HTTP(S) service diagnostics tool for SREs. It breaks every phase of a request
+into a latency waterfall, inspects TLS certificates, and can probe continuously
+like `ping`. Both a CLI and a TUI are supported.
+
+There are two commands — the full name **`httprove`** and the short alias **`hpr`**
+(they are identical; every example in this document works with `hpr` too).
 
 ```
 DNS      ▕██▏              12.3 ms
@@ -17,94 +24,94 @@ Download               ▕▏   2.1 ms
 Total                     117.6 ms
 ```
 
-## 주요 기능
+## Features
 
-- **단계별 워터폴** — DNS/TCP/TLS/TTFB/Download를 쪼개 병목 위치 식별
-- **TLS 심층 검사** — 버전/cipher/키교환, 체인 만료(최약링크)·SAN·발급자, 핸드셰이크 실패 원인 디코딩, 체인 완결성+AIA 복구
-- **건강 판정** — `--verdict`로 PASS/DEGRADED/DOWN + 근거 한 줄, `--explain` 평문 설명
-- **백엔드·경로 국소화** — `--fanout`(IP별), `--all-families`(v4/v6), `--via`(멀티 리졸버), `trace`(traceroute)
-- **변경 추적** — `diff`(두 캡처 비교), `--since-good`(마지막 정상 대비 지문 변경)
-- **지속 모니터링** — ping 모드 + 백분위 통계, 실시간 TUI 대시보드, 멀티 타깃
-- **합성 모니터링** — `--expect-*` 어설션(종료 코드 3), `--warn` 임계값 강조
-- **연동** — JSON/NDJSON, Prometheus(`--prom`/`--listen`), OTLP(`--otlp`), HTML 리포트(`--report`)
-- **캡처** — `--trap`(첫 실패 동결), `--record`/`replay`(인시던트 기록·재생)
-- **운영** — keep-alive 모드, `--resolve`, 인증서 일괄 점검(`--cert-check`), 베이스라인 비교
-- **두 명령** — `httprove`(정식)/`hpr`(단축), `httprove update`로 자가 업데이트
+- **Per-phase waterfall** — splits DNS/TCP/TLS/TTFB/Download to pinpoint the bottleneck
+- **Deep TLS inspection** — version/cipher/key-exchange, chain expiry (weakest link)·SAN·issuer, handshake-failure cause decoding, chain completeness + AIA repair
+- **Health verdict** — `--verdict` gives PASS/DEGRADED/DOWN plus a one-line rationale, `--explain` for plain-language explanation
+- **Backend & path localization** — `--fanout` (per-IP), `--all-families` (v4/v6), `--via` (multi-resolver), `trace` (traceroute)
+- **Change tracking** — `diff` (compare two captures), `--since-good` (fingerprint drift vs. last-known-good)
+- **Continuous monitoring** — ping mode + percentile stats, live TUI dashboard, multi-target
+- **Synthetic monitoring** — `--expect-*` assertions (exit code 3), `--warn` threshold highlighting
+- **Integration** — JSON/NDJSON, Prometheus (`--prom`/`--listen`), OTLP (`--otlp`), HTML report (`--report`)
+- **Capture** — `--trap` (freeze on first failure), `--record`/`replay` (record & replay incidents)
+- **Operations** — keep-alive mode, `--resolve`, bulk certificate check (`--cert-check`), baseline comparison
+- **Two commands** — `httprove` (full)/`hpr` (short), self-update via `httprove update`
 
-## 무엇을 측정하나
+## What it measures
 
-매 프로브마다 **새 연결을 직접 수립**하여 각 단계를 실측한다 (커넥션 풀 재사용 없음 —
-매번 전체 스택을 측정하는 것이 목적):
+Every probe **establishes a fresh connection directly** and measures each phase
+(no connection-pool reuse — the goal is to measure the full stack every time):
 
-| 단계 | 의미 | 병목 시 의심 지점 |
-|------|------|------|
-| DNS | 이름 해석 (`getaddrinfo`) | 리졸버, TTL, 네거티브 캐시 |
-| TCP | TCP 3-way handshake | 네트워크 RTT, SYN drop, 방화벽 |
-| TLS | TLS 핸드셰이크 (rustls) | 인증서 체인 크기, OCSP, TLS 버전 |
-| TTFB | 요청 전송 → 응답 헤더 수신 | **서버 처리 시간**, 업스트림, DB |
-| Download | 응답 바디 전체 수신 | 대역폭, 응답 크기, 압축 |
+| Phase | Meaning | Suspect when slow |
+|-------|---------|-------------------|
+| DNS | Name resolution (`getaddrinfo`) | Resolver, TTL, negative cache |
+| TCP | TCP 3-way handshake | Network RTT, SYN drop, firewall |
+| TLS | TLS handshake (rustls) | Cert chain size, OCSP, TLS version |
+| TTFB | Request sent → response headers received | **Server processing time**, upstream, DB |
+| Download | Full response body received | Bandwidth, response size, compression |
 
-추가로 수집: 협상된 HTTP 버전(ALPN h2/http1.1), TLS 버전/cipher/키 교환 그룹(X25519 등),
-인증서 체인(만료일, D-day, SAN, 발급자, 키/서명 알고리즘, 체인 구조),
-DNS 전체 레코드, 로컬 소켓 주소(소스 IP), 응답 크기/전송률,
-주요 응답 헤더(server, content-type, 캐시/CDN 상태).
+Also collected: negotiated HTTP version (ALPN h2/http1.1), TLS version/cipher/key-exchange
+group (X25519, etc.), certificate chain (expiry, D-day, SAN, issuer, key/signature algorithm,
+chain structure), full DNS records, local socket address (source IP), response size/transfer rate,
+and key response headers (server, content-type, cache/CDN status).
 
-## 설치
+## Installation
 
-### Homebrew (권장)
+### Homebrew (recommended)
 
 ```bash
 brew install x-mesh/tap/httprove
 ```
 
-### 설치 스크립트
+### Install script
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/x-mesh/httprove/main/install.sh | sh
 ```
 
-OS/아키텍처를 감지해 최신 릴리스 바이너리를 받고 sha256으로 검증한 뒤
-`~/.local/bin`(또는 `/usr/local/bin`)에 설치하고 `hpr` 별칭을 만든다.
+Detects your OS/architecture, downloads the latest release binary, verifies it with
+sha256, installs it to `~/.local/bin` (or `/usr/local/bin`), and creates the `hpr` alias.
 
-### 업데이트
+### Update
 
-설치 방식에 맞춰 스스로 최신 버전으로 갱신한다:
-
-```bash
-httprove update              # brew면 brew upgrade로 위임, 그 외엔 바이너리 자가 교체
-httprove update --check      # 새 버전 여부만 확인 (최신=exit 0, 갱신가능=exit 1)
-httprove update --dry-run    # 무엇을 할지만 출력
-httprove update --to v0.2.0  # 특정 버전 고정 (manual 설치)
-```
-
-### 소스 빌드
+Updates itself to the latest version according to how it was installed:
 
 ```bash
-make release          # 릴리스 빌드 → ./target/release/{httprove,hpr}
-make build            # 디버깅 빌드 → ./target/debug/{httprove,hpr}
-make ci               # 포맷 검사 + clippy + 테스트 + 릴리스 빌드
-make smoke            # 실서비스 대상 스모크 테스트
-make install          # ~/.cargo/bin에 httprove + hpr 설치
-make help             # 전체 타깃 목록
+httprove update              # delegates to brew upgrade if installed via brew; otherwise self-replaces the binary
+httprove update --check      # only check for a new version (up-to-date = exit 0, update available = exit 1)
+httprove update --dry-run    # print what it would do, without doing it
+httprove update --to v0.2.0  # pin a specific version (manual installs)
 ```
 
-cargo를 직접 써도 된다: `cargo build --release`
+### Build from source
 
-## 사용법
+```bash
+make release          # release build → ./target/release/{httprove,hpr}
+make build            # debug build → ./target/debug/{httprove,hpr}
+make ci               # format check + clippy + tests + release build
+make smoke            # smoke test against a live service
+make install          # install httprove + hpr to ~/.cargo/bin
+make help             # list all targets
+```
 
-### 단발 점검 (워터폴 + 인증서 상세)
+You can also use cargo directly: `cargo build --release`
+
+## Usage
+
+### One-shot check (waterfall + certificate detail)
 
 ```bash
 httprove https://api.example.com
-httprove https://api.example.com -v        # 응답 헤더 + 인증서 체인 전체
-httprove https://api.example.com --json    # 스크립트 연동용 JSON
+httprove https://api.example.com -v        # response headers + full certificate chain
+httprove https://api.example.com --json    # JSON for scripting
 ```
 
-### ping 모드 (지속 모니터링)
+### ping mode (continuous monitoring)
 
 ```bash
-httprove -c 0 https://api.example.com            # Ctrl-C까지 1초 간격
-httprove -c 100 -i 0.5 https://api.example.com   # 0.5초 간격 100회
+httprove -c 0 https://api.example.com            # 1s interval until Ctrl-C
+httprove -c 100 -i 0.5 https://api.example.com   # 100 probes at 0.5s interval
 ```
 
 ```
@@ -117,200 +124,204 @@ phase        min       avg       p50       p95       max    stddev
 ...
 ```
 
-종료 코드: 모든 프로브 통과 `0` │ 네트워크 실패/실행 오류 `1` │
-네트워크는 성공했지만 `--expect-*` 어설션 위반 `3` (cron/알람 연동용).
+Exit codes: all probes passed `0` │ network failure/execution error `1` │
+network succeeded but `--expect-*` assertion violated `3` (for cron/alert integration).
 
-### 어설션 (합성 모니터링)
+### Assertions (synthetic monitoring)
 
 ```bash
 httprove --expect-status 200 --expect-ttfb 500 --expect-body '"ok"' https://api.example.com/health
-httprove --expect-status 2xx,3xx https://example.com     # 클래스 표기 지원
-httprove --expect-cert-days 30 https://api.example.com   # 인증서 잔여 30일 미만이면 exit 3
+httprove --expect-status 2xx,3xx https://example.com     # class notation supported
+httprove --expect-cert-days 30 https://api.example.com   # exit 3 if cert has fewer than 30 days left
 ```
 
-위반 시 ping 라인/단발 출력에 `EXPECT-FAIL: …`이 표시되고 종료 코드 3으로 끝난다.
+On violation, `EXPECT-FAIL: …` is shown in the ping line / one-shot output and the process exits with code 3.
 
-### 임계값 강조
+### Threshold highlighting
 
 ```bash
 httprove -c 0 --warn ttfb=300 --warn total=800 https://api.example.com
 ```
 
-임계 초과 단계는 노랑(≥1x), 빨강(≥2x)으로 강조된다 (CLI/TUI 공통).
+Phases over threshold are highlighted in yellow (≥1x) and red (≥2x) (CLI/TUI alike).
 
-### keep-alive 모드 (연결 비용 vs 서버 시간 분리)
+### keep-alive mode (connection cost vs. server time)
 
 ```bash
 httprove --keepalive -c 0 https://api.example.com
 ```
 
-첫 프로브만 DNS/TCP/TLS를 수행하고 이후엔 같은 연결로 요청만 보낸다
-(`conn=reused` 표시). 신규 연결 프로브와 비교하면 "커넥션 수립이 느린지,
-서버 처리가 느린지"를 분리할 수 있다.
+Only the first probe does DNS/TCP/TLS; subsequent probes send requests over the same
+connection (shown as `conn=reused`). Comparing against fresh-connection probes lets you
+separate "is connection setup slow, or is server processing slow?".
 
-### 멀티 타깃
+### Multi-target
 
 ```bash
-httprove -c 0 https://a.example.com https://b.example.com   # [host] 태그로 인터리브
-httprove --tui https://a.example.com https://b.example.com  # 차트 겹쳐 그리기, tab으로 전환
+httprove -c 0 https://a.example.com https://b.example.com   # interleaved with [host] tags
+httprove --tui https://a.example.com https://b.example.com  # overlaid charts, switch with tab
 ```
 
-### Prometheus 연동
+### Prometheus integration
 
 ```bash
-# node_exporter textfile collector용 스냅샷
+# snapshot for the node_exporter textfile collector
 httprove -c 10 --prom https://api.example.com > /var/lib/node_exporter/httprove.prom
 
-# 상시 exporter (무한 프로브 + /metrics 서버)
+# long-running exporter (infinite probing + /metrics server)
 httprove --listen 0.0.0.0:9912 -i 5 https://api.example.com https://b.example.com
 curl localhost:9912/metrics
 ```
 
 `httprove_phase_milliseconds{target,phase,stat}`, `httprove_probes_total`,
-`httprove_cert_expiry_days` 등 단계별 백분위가 그대로 노출된다.
+`httprove_cert_expiry_days`, and other per-phase percentiles are exposed as-is.
 
-### 베이스라인 비교 (배포 전후 회귀 감지)
+### Baseline comparison (detect regressions across a deploy)
 
 ```bash
-httprove -c 30 --save before.json https://api.example.com    # 배포 전
-httprove -c 30 --compare before.json https://api.example.com # 배포 후: p50/p95 delta% 테이블
+httprove -c 30 --save before.json https://api.example.com    # before deploy
+httprove -c 30 --compare before.json https://api.example.com # after deploy: p50/p95 delta% table
 ```
 
-### 인증서 일괄 점검
+### Bulk certificate check
 
 ```bash
 httprove --cert-check api.example.com b.example.com:8443 @domains.txt
 httprove --cert-check --json @domains.txt | jq '.[] | select(.days_remaining < 30)'
 ```
 
-만료 임박 순 테이블 출력. EXPIRED/연결 실패가 있으면 exit 1.
+Outputs a table sorted by nearest expiry. Exits 1 if any are EXPIRED or fail to connect.
 
-### TUI 대시보드
+### TUI dashboard
 
 ```bash
 httprove --tui https://api.example.com
 ```
 
-실시간 레이턴시 차트 + 최신 워터폴 + 단계별 통계 + 프로브 히스토리(하단,
-ping 라인 스타일로 최근 결과를 한 줄씩 — 실패는 빨강으로 표시).
-키: `q` 종료, `space` 일시정지, `r` 통계 초기화.
+Live latency chart + latest waterfall + per-phase stats + probe history (bottom,
+ping-line style showing recent results one per line — failures in red).
+Keys: `q` quit, `space` pause, `r` reset stats.
 
-### 문제 조사용 옵션
+### Troubleshooting options
 
 ```bash
-httprove -L https://example.com              # 리다이렉트 추적 (hop별 측정)
-httprove --resolve 10.0.0.5 https://api.example.com   # 특정 백엔드 직접 타격 (DNS 우회, SNI/Host 유지)
-httprove -4 https://api.example.com          # IPv4 강제 (-6: IPv6)
-httprove --http1 https://api.example.com     # HTTP/1.1 강제 (h2 협상 비활성)
-httprove -k https://expired.internal         # 인증서 검증 생략 (체인 정보는 그대로 수집)
-httprove -t 3 https://api.example.com        # 프로브 전체 타임아웃 3초
+httprove -L https://example.com              # follow redirects (measured per hop)
+httprove --resolve 10.0.0.5 https://api.example.com   # hit a specific backend directly (bypass DNS, keep SNI/Host)
+httprove -4 https://api.example.com          # force IPv4 (-6: IPv6)
+httprove --http1 https://api.example.com     # force HTTP/1.1 (disable h2 negotiation)
+httprove -k https://expired.internal         # skip certificate verification (chain info still collected)
+httprove -t 3 https://api.example.com        # 3s timeout for the whole probe
 httprove -X POST -d '{"ping":1}' -H 'Content-Type: application/json' https://api.example.com/health
-httprove --cert-warn 14 https://api.example.com   # 만료 14일 전부터 경고
+httprove --cert-warn 14 https://api.example.com   # warn from 14 days before expiry
 ```
 
-실패 시 **어느 단계에서** 실패했는지 보고한다 (`ERROR(dns)`, `ERROR(tls): certificate has expired`, …).
+On failure it reports **which phase** failed (`ERROR(dns)`, `ERROR(tls): certificate has expired`, …).
 
-### JSON 출력 (모니터링 파이프라인 연동)
+### JSON output (monitoring-pipeline integration)
 
 ```bash
 httprove -c 10 --json https://api.example.com | jq 'select(.type=="probe") | .total_ms'
 ```
 
-- 프로브 1건당 한 줄: `{"type":"probe","seq":0,"hops":[{"timings":{...},"cert_chain":[...],...}],...}`
-- 마지막에 요약 한 줄: `{"type":"summary","phases":{"ttfb":{"p95":...},...},"status_counts":{"200":10},...}`
+- One line per probe: `{"type":"probe","seq":0,"hops":[{"timings":{...},"cert_chain":[...],...}],...}`
+- A summary line at the end: `{"type":"summary","phases":{"ttfb":{"p95":...},...},"status_counts":{"200":10},...}`
 
-## 심층 진단 (숫자를 결론으로)
+## Deep diagnosis (from numbers to conclusions)
 
-숫자를 보여주는 데서 그치지 않고 "어디가·왜 문제인지"를 판정한다.
+It doesn't stop at showing numbers — it determines "what is wrong, and why".
 
-### 건강 판정 + 평문 설명
-
-```bash
-httprove --verdict https://api.example.com   # 끝에 PASS/DEGRADED/DOWN + 근거 한 줄
-httprove --explain https://api.example.com   # "TCP 39ms, 서버 21ms(TTFB), 총 60ms over HTTP/2"
-```
-
-종료 코드는 PASS=0 / DOWN=1로 합성 모니터링에 바로 쓴다.
-
-### 백엔드·경로 국소화
+### Health verdict + plain-language explanation
 
 ```bash
-httprove --fanout https://api.example.com          # DNS의 모든 IP를 개별 프로브, 불량 백엔드(outlier) 적발
-httprove --all-families https://api.example.com    # IPv4 vs IPv6 단계별 비교
-httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # 리졸버별 응답 IP/POP 비교 (--ecs로 client-subnet)
-httprove trace https://api.example.com             # 시스템 traceroute + TLS 종단 hop 주석
+httprove --verdict https://api.example.com   # ends with PASS/DEGRADED/DOWN + one-line rationale
+httprove --explain https://api.example.com   # "TCP 39ms, server 21ms (TTFB), 60ms total over HTTP/2"
 ```
 
-### TLS 신뢰 심화
+Exit code is PASS=0 / DOWN=1, ready to use directly in synthetic monitoring.
+
+### Backend & path localization
 
 ```bash
-httprove --check-chain https://api.example.com   # 중간 인증서 누락 + AIA 복구 가능 여부
-httprove https://expired.example.com             # 핸드셰이크 실패를 원인+해법으로 번역 (hint:)
+httprove --fanout https://api.example.com          # probe every DNS IP individually, catch a bad backend (outlier)
+httprove --all-families https://api.example.com    # IPv4 vs IPv6 phase-by-phase comparison
+httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # compare response IP/POP per resolver (--ecs for client-subnet)
+httprove trace https://api.example.com             # system traceroute + TLS-terminating hop annotation
 ```
 
-`--check-chain`은 "브라우저는 되는데 curl/Go는 실패"하는 미완 체인을 잡아낸다.
-인증서 블록은 항상 체인 전체의 최약 링크 만료일(`weakest:`)을 표시한다.
-
-### 변경 추적 · 캡처 · 연동
+### Deep TLS trust
 
 ```bash
-httprove https://x --json > before.json          # 두 시점/엔드포인트 비교
-httprove diff before.json after.json             # 바뀐 필드만 (cert serial, IP set, TLS, 헤더…)
-httprove --since-good /var/lib/httprove/x.state https://x   # 마지막 정상 대비 지문 변경 시 비-0
-httprove --since-good x.state --on-change https://x         # CI: 지문이 바뀌면 비-0 종료 (배포 검증)
-httprove --annotate-deploy before.json https://x            # 저장된 프로브 대비 변경 주석
-httprove --trap -c 0 https://x                   # 첫 실패에서 동결, 전체 트랜잭션 덤프
-httprove --record sess.json -c 100 https://x && httprove replay sess.json   # 인시던트 기록/재생
-httprove --report out.html https://x             # 공유용 단일 HTML 리포트
-httprove --otlp http://collector:4318 --traceparent https://x   # OTLP span 내보내기 + traceparent 주입
+httprove --check-chain https://api.example.com   # missing intermediate certificate + AIA repair feasibility
+httprove https://expired.example.com             # translates handshake failure into cause + fix (hint:)
 ```
 
-`--on-change`는 지문(cert·IP·TLS·헤더)이 직전 정상 상태와 달라지면 종료 코드를 비-0으로
-바꿔, 배포 후 "의도치 않은 변경"을 CI에서 잡는 데 쓴다.
+`--check-chain` catches incomplete chains that "work in the browser but fail in curl/Go".
+The certificate block always shows the weakest-link expiry of the whole chain (`weakest:`).
 
-## 활용 시나리오
+### Change tracking · capture · integration
 
-- **"서비스가 느린데 어디가 느린지 모르겠다"** → 단발 워터폴 + `--verdict`로 DNS/네트워크/서버 중 병목 판정
-- **"전부 느린가, 한 노드만 느린가"** → `--fanout`으로 백엔드 IP별 비교, 불량 노드 적발
-- **"무엇이 바뀌었나"** → `--since-good` 또는 `diff`로 cert/IP/TLS/헤더 변경 추적
-- **배포 전후 레이턴시 비교** → `--save`/`--compare`로 p50/p95 delta%
-- **간헐적 타임아웃 추적** → `--trap`으로 첫 실패 동결, 또는 `--tui`로 관찰
-- **인증서 만료/체인 점검** → `--cert-warn`·`--check-chain`·`--cert-check`로 cron 알람
-- **합성 모니터링** → `--expect-*`(exit 3) + `--otlp`로 트레이싱 백엔드 연동
+```bash
+httprove https://x --json > before.json          # compare two points in time / endpoints
+httprove diff before.json after.json             # only the changed fields (cert serial, IP set, TLS, headers…)
+httprove --since-good /var/lib/httprove/x.state https://x   # non-0 when fingerprint drifts from last-known-good
+httprove --since-good x.state --on-change https://x         # CI: non-0 exit when fingerprint changes (deploy verification)
+httprove --annotate-deploy before.json https://x            # annotate changes vs. a saved probe
+httprove --trap -c 0 https://x                   # freeze on first failure, dump the whole transaction
+httprove --record sess.json -c 100 https://x && httprove replay sess.json   # record/replay an incident
+httprove --report out.html https://x             # single self-contained HTML report for sharing
+httprove --otlp http://collector:4318 --traceparent https://x   # export OTLP span + inject traceparent
+```
 
-## 종료 코드
+`--on-change` flips the exit code to non-0 when the fingerprint (cert·IP·TLS·headers) differs
+from the previous good state — used to catch "unintended changes" after a deploy in CI.
 
-| 코드 | 의미 |
-|:---:|------|
-| 0 | 모든 프로브 통과 (verdict PASS/DEGRADED) |
-| 1 | 네트워크 실패·실행 오류 (verdict DOWN), `--fanout`/`--cert-check` 등에서 결함 발견 |
-| 3 | 네트워크는 성공했으나 `--expect-*` 어설션 위반 |
+## Scenarios
 
-## 구조
+- **"The service is slow but I don't know where"** → one-shot waterfall + `--verdict` to decide whether DNS/network/server is the bottleneck
+- **"Is everything slow, or just one node?"** → `--fanout` to compare per backend IP and catch the bad node
+- **"What changed?"** → `--since-good` or `diff` to track cert/IP/TLS/header changes
+- **Compare latency across a deploy** → `--save`/`--compare` for p50/p95 delta%
+- **Track intermittent timeouts** → `--trap` to freeze on first failure, or `--tui` to observe
+- **Certificate expiry/chain checks** → `--cert-warn`·`--check-chain`·`--cert-check` for cron alerts
+- **Synthetic monitoring** → `--expect-*` (exit 3) + `--otlp` to feed a tracing backend
+
+## Exit codes
+
+| Code | Meaning |
+|:---:|---------|
+| 0 | All probes passed (verdict PASS/DEGRADED) |
+| 1 | Network failure / execution error (verdict DOWN), or a defect found by `--fanout`/`--cert-check` etc. |
+| 3 | Network succeeded but an `--expect-*` assertion was violated |
+
+## Structure
 
 ```
 src/
-├── lib.rs         # 진입점 cli_main: 서브커맨드/모드 라우팅, 시그널, 종료 코드
-├── main.rs        # `httprove` 진입점 (lib::cli_main 호출)
-├── bin/hpr.rs     # `hpr` 진입점 (동일 바이너리)
-├── cli.rs         # clap 인자 → ProbeConfig / Expectations / WarnThresholds
-├── types.rs       # 공유 타입 (ProbeResult/CertInfo/Verdict/Fingerprint/ChainAnalysis, Serialize+Deserialize)
-├── probe.rs       # 핵심: 수동 DNS/TCP/TLS/HTTP 연결 + 단계별 실측, keepalive (rustls ring + hyper)
-├── cert.rs        # x509 체인 분석 (SPKI 핀 포함)
-├── cert_check.rs  # --cert-check 일괄 점검
-├── hash.rs        # 공유 SHA-256 (의존성 없이; cert 핀·자가 업데이트 검증)
-├── verdict.rs     # 건강 판정 PASS/DEGRADED/DOWN (--verdict/--explain)
-├── diff.rs        # 지문 추출 + 프로브 JSON diff (diff 서브커맨드/--since-good)
-├── fanout.rs      # --fanout(IP별), --all-families(v4/v6)
-├── dns.rs         # 자체 DNS-over-UDP 클라이언트 (--via 멀티 리졸버 + --ecs)
-├── trace.rs       # 시스템 traceroute + TLS 종단 hop 주석
-├── chain.rs       # 체인 완결성/AIA 복구, 최약링크 만료, 핸드셰이크 에러 디코더
-├── record.rs      # --record/replay, --trap (첫 실패 동결)
-├── otlp.rs        # OTLP/HTTP span export, Server-Timing 파싱, traceparent
+├── lib.rs         # entry point cli_main: subcommand/mode routing, signals, exit codes
+├── main.rs        # `httprove` entry point (calls lib::cli_main)
+├── bin/hpr.rs     # `hpr` entry point (same binary)
+├── cli.rs         # clap args → ProbeConfig / Expectations / WarnThresholds
+├── types.rs       # shared types (ProbeResult/CertInfo/Verdict/Fingerprint/ChainAnalysis, Serialize+Deserialize)
+├── probe.rs       # core: manual DNS/TCP/TLS/HTTP connection + per-phase measurement, keepalive (rustls ring + hyper)
+├── cert.rs        # x509 chain analysis (incl. SPKI pin)
+├── cert_check.rs  # --cert-check bulk check
+├── hash.rs        # shared SHA-256 (dependency-free; cert pin & self-update verification)
+├── verdict.rs     # health verdict PASS/DEGRADED/DOWN (--verdict/--explain)
+├── diff.rs        # fingerprint extraction + probe JSON diff (diff subcommand/--since-good)
+├── fanout.rs      # --fanout (per-IP), --all-families (v4/v6)
+├── dns.rs         # custom DNS-over-UDP client (--via multi-resolver + --ecs)
+├── trace.rs       # system traceroute + TLS-terminating hop annotation
+├── chain.rs       # chain completeness/AIA repair, weakest-link expiry, handshake error decoder
+├── record.rs      # --record/replay, --trap (freeze on first failure)
+├── otlp.rs        # OTLP/HTTP span export, Server-Timing parsing, traceparent
 ├── exporter.rs    # --listen Prometheus exporter
-├── stats.rs       # Welford + 링버퍼 백분위
-├── runner.rs      # 프로브 반복 루프 (멀티 타깃/간격/일시정지/취소)
-├── update/        # httprove update — 설치방식 감지 + 자가 교체
-├── output/        # 텍스트(워터폴/ping/요약) + JSON + prom + baseline + HTML 리포트
-└── tui/           # ratatui 대시보드 (멀티 타깃)
+├── stats.rs       # Welford + ring-buffer percentiles
+├── runner.rs      # probe loop (multi-target/interval/pause/cancel)
+├── update/        # httprove update — install-method detection + self-replacement
+├── output/        # text (waterfall/ping/summary) + JSON + prom + baseline + HTML report
+└── tui/           # ratatui dashboard (multi-target)
 ```
+
+## License
+
+[MIT](LICENSE)
