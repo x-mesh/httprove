@@ -21,4 +21,8 @@ pub struct OutputConfig {
     pub warn: WarnThresholds,
     /// 멀티 타깃 모드: ping 라인 앞에 타깃 표시.
     pub show_target: bool,
+    /// SLO 목표 비율(예: 0.999). Some이면 httprove_slo_target_ratio로 노출. B4.
+    pub slo: Option<f64>,
+    /// Apdex 만족 임계 T(ms). Some이면 StatsCollector가 satisfied/tolerating을 집계. B3.
+    pub apdex_threshold: Option<f64>,
 }

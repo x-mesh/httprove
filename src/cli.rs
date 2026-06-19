@@ -254,6 +254,16 @@ pub struct Args {
     /// Compare against this last-known-good probe JSON
     #[arg(long = "since-good", value_name = "PATH")]
     pub since_good: Option<String>,
+
+    /// SLO target ratio in (0,1), e.g. 0.999 — exported as httprove_slo_target_ratio
+    /// to parameterize burn-rate alert rules (burn calc stays in PromQL).
+    #[arg(long, value_name = "RATIO")]
+    pub slo: Option<f64>,
+
+    /// Apdex satisfaction threshold T in ms — exports apdex_satisfied/tolerating_total
+    /// counters (satisfied: total<=T, tolerating: T<total<=4T).
+    #[arg(long = "apdex-threshold", value_name = "MS")]
+    pub apdex_threshold: Option<f64>,
 }
 
 impl Args {
@@ -266,6 +276,17 @@ impl Args {
         }
         if self.interval < 0.0 || !self.interval.is_finite() {
             bail!("--interval must be a non-negative finite number");
+        }
+        // SLO는 burn-rate 룰의 (1-SLO) 상수가 되므로 0.999 vs 99.9 단위 혼동을 하드 차단한다.
+        if let Some(slo) = self.slo
+            && !(slo > 0.0 && slo < 1.0)
+        {
+            bail!("--slo must be a ratio in (0, 1), e.g. 0.999 (not 99.9 or 99.9%)");
+        }
+        if let Some(t) = self.apdex_threshold
+            && (t <= 0.0 || !t.is_finite())
+        {
+            bail!("--apdex-threshold must be a positive finite number of milliseconds");
         }
 
         let mut headers = Vec::new();

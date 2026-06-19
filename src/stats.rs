@@ -168,11 +168,25 @@ pub struct StatsCollector {
     last_sorted_ips: Option<Vec<String>>,
     /// 직전 대비 resolved IP 집합이 바뀐 누적 횟수. B11.
     dns_answer_changes: u64,
+    /// Apdex 만족 임계 T(ms). Some이면 record가 성공 프로브를 satisfied/tolerating으로 분류. B3.
+    apdex_threshold: Option<f64>,
+    /// total_ms <= T 인 성공 프로브 수(satisfied). B3.
+    apdex_satisfied: u64,
+    /// T < total_ms <= 4T 인 성공 프로브 수(tolerating). B3.
+    apdex_tolerating: u64,
 }
 
 impl StatsCollector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apdex 만족 임계 T(ms)를 가진 수집기. None이면 new()와 동일(Apdex 미집계). B3.
+    pub fn with_apdex_threshold(threshold: Option<f64>) -> Self {
+        Self {
+            apdex_threshold: threshold,
+            ..Self::default()
+        }
     }
 
     /// 프로브 결과 1건 반영.
@@ -247,6 +261,17 @@ impl StatsCollector {
         if body >= MIN_GOODPUT_BODY_BYTES && t.download_ms > 0.0 {
             self.throughput.push(body as f64 / (t.download_ms / 1000.0)); // bytes/s
         }
+
+        // B3: Apdex 분류(임계 설정 시만). satisfied: total<=T, tolerating: T<total<=4T.
+        // 그 외(>4T)는 frustrated라 어느 카운터도 안 올린다 — probes_total 분모와 함께
+        // PromQL `(satisfied+tolerating/2)/probes`로 Apdex를 복원한다.
+        if let Some(threshold) = self.apdex_threshold {
+            if t.total_ms <= threshold {
+                self.apdex_satisfied += 1;
+            } else if t.total_ms <= 4.0 * threshold {
+                self.apdex_tolerating += 1;
+            }
+        }
     }
 
     /// 보낸 프로브 수 (성공 + 실패).
@@ -311,9 +336,26 @@ impl StatsCollector {
         self.dns_answer_changes
     }
 
-    /// 모든 누적치 초기화 (TUI의 r 키).
+    /// Apdex 만족 임계 T(ms). None이면 Apdex 미집계(메트릭 생략). B3.
+    pub fn apdex_threshold(&self) -> Option<f64> {
+        self.apdex_threshold
+    }
+
+    /// Apdex satisfied(total<=T) 누적 수. B3.
+    pub fn apdex_satisfied(&self) -> u64 {
+        self.apdex_satisfied
+    }
+
+    /// Apdex tolerating(T<total<=4T) 누적 수. B3.
+    pub fn apdex_tolerating(&self) -> u64 {
+        self.apdex_tolerating
+    }
+
+    /// 모든 누적치 초기화 (TUI의 r 키). Apdex 임계는 설정값이라 보존한다.
     pub fn reset(&mut self) {
+        let apdex_threshold = self.apdex_threshold;
         *self = Self::new();
+        self.apdex_threshold = apdex_threshold;
     }
 }
 
@@ -653,5 +695,37 @@ mod tests {
         assert_eq!(stats.hops_reused(), 0);
         assert!(stats.http_version_counts().is_empty());
         assert_eq!(stats.dns_answer_changes(), 0);
+    }
+
+    // === v0.3 트랙2: B3(Apdex) ===
+
+    #[test]
+    fn b3_apdex_classifies_by_threshold() {
+        // T=100ms → satisfied(<=100), tolerating(100<x<=400), frustrated(>400, 미집계).
+        let mut stats = StatsCollector::with_apdex_threshold(Some(100.0));
+        stats.record(&ok_probe(0, 50.0, false)); // satisfied
+        stats.record(&ok_probe(1, 300.0, false)); // tolerating
+        stats.record(&ok_probe(2, 500.0, false)); // frustrated
+        assert_eq!(stats.apdex_satisfied(), 1);
+        assert_eq!(stats.apdex_tolerating(), 1);
+        assert_eq!(stats.apdex_threshold(), Some(100.0));
+    }
+
+    #[test]
+    fn b3_apdex_disabled_without_threshold() {
+        let mut stats = StatsCollector::new(); // threshold None
+        stats.record(&ok_probe(0, 50.0, false));
+        assert_eq!(stats.apdex_satisfied(), 0);
+        assert_eq!(stats.apdex_tolerating(), 0);
+        assert_eq!(stats.apdex_threshold(), None);
+    }
+
+    #[test]
+    fn b3_apdex_threshold_survives_reset() {
+        let mut stats = StatsCollector::with_apdex_threshold(Some(200.0));
+        stats.record(&ok_probe(0, 50.0, false));
+        stats.reset();
+        assert_eq!(stats.apdex_satisfied(), 0); // 카운터는 리셋
+        assert_eq!(stats.apdex_threshold(), Some(200.0)); // 임계는 보존
     }
 }

@@ -31,6 +31,9 @@
 //! - `httprove_target_up{target}` gauge — 타깃 health(1=up/degraded, 0=down)
 //! - `httprove_targets_total` gauge — 모니터링 타깃 수(target 레이블 없음)
 //! - `httprove_targets_down` gauge — 최신 DOWN 판정 타깃 수(target 레이블 없음)
+//! - `httprove_apdex_satisfied_total{target}` counter — total<=T 성공 프로브(--apdex-threshold)
+//! - `httprove_apdex_tolerating_total{target}` counter — T<total<=4T 성공 프로브
+//! - `httprove_slo_target_ratio{target}` gauge — 설정한 SLO 목표 비율(--slo, 설정값)
 //!
 //! ## 규칙
 //! - 각 메트릭 이름마다 # HELP / # TYPE 헤더를 1회 출력.
@@ -52,6 +55,8 @@ pub struct TargetMetrics<'a> {
     /// precompute한다 — last_success가 아니라 *최신* 결과여야 실패를 Down으로 반영한다.
     /// None이면 아직 결과 없는 warmup → verdict/up/down 메트릭에서 not-down으로 취급.
     pub verdict_state: Option<VerdictState>,
+    /// SLO 목표 비율(예: 0.999). --slo로 설정. Some이면 httprove_slo_target_ratio 노출(설정값). B4.
+    pub slo: Option<f64>,
 }
 
 /// phase 게이지의 stat 레이블 출력 순서.
@@ -209,6 +214,39 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
         "Download goodput in bytes/s (sum of hop body_bytes / sum of hop download_seconds) for successful probes whose total body >= 4096 bytes.",
         "gauge",
         &throughput_lines,
+    );
+
+    // --- B3 Apdex: 임계(--apdex-threshold T)가 설정된 타깃만 누적 카운터 2종 노출.
+    //     >4T(frustrated)는 어느 카운터도 안 올리고, Apdex는 probes_total 분모로 PromQL 복원. ---
+    let mut apdex_satisfied_lines = Vec::new();
+    let mut apdex_tolerating_lines = Vec::new();
+    for t in targets {
+        if t.stats.apdex_threshold().is_none() {
+            continue;
+        }
+        let target = escape_label(t.target);
+        apdex_satisfied_lines.push(format!(
+            "httprove_apdex_satisfied_total{{target=\"{target}\"}} {}",
+            t.stats.apdex_satisfied()
+        ));
+        apdex_tolerating_lines.push(format!(
+            "httprove_apdex_tolerating_total{{target=\"{target}\"}} {}",
+            t.stats.apdex_tolerating()
+        ));
+    }
+    push_section(
+        &mut out,
+        "httprove_apdex_satisfied_total",
+        "Successful probes whose total time is within the Apdex threshold T (satisfied).",
+        "counter",
+        &apdex_satisfied_lines,
+    );
+    push_section(
+        &mut out,
+        "httprove_apdex_tolerating_total",
+        "Successful probes whose total time is within 4T (tolerating; T < total <= 4T).",
+        "counter",
+        &apdex_tolerating_lines,
     );
 
     // --- 상태 코드 분포: BTreeMap이라 코드 오름차순 ---------------------------
@@ -607,6 +645,26 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
         &[format!("httprove_targets_down {down}")],
     );
 
+    // --- B4 SLO 목표 비율: 측정값이 아니라 설정값(무상태). --slo 있는 타깃만.
+    //     burn-rate/error-budget 계산은 Prometheus에 위임하고, (1-SLO) 상수만 메트릭화. ---
+    let mut slo_lines = Vec::new();
+    for t in targets {
+        let Some(slo) = t.slo else {
+            continue;
+        };
+        slo_lines.push(format!(
+            "httprove_slo_target_ratio{{target=\"{}\"}} {slo}",
+            escape_label(t.target)
+        ));
+    }
+    push_section(
+        &mut out,
+        "httprove_slo_target_ratio",
+        "Configured SLO target ratio (e.g. 0.999); a static setting for parameterizing burn-rate alert rules.",
+        "gauge",
+        &slo_lines,
+    );
+
     out
 }
 
@@ -705,6 +763,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         assert!(
@@ -739,6 +798,7 @@ mod tests {
             stats: &stats,
             last_success: last.as_ref(),
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         let t = r#"target="https://example.com/""#;
@@ -789,12 +849,14 @@ mod tests {
                 stats: &stats_a,
                 last_success: None,
                 verdict_state: None,
+                slo: None,
             },
             TargetMetrics {
                 target: "https://b.example/",
                 stats: &stats_b,
                 last_success: None,
                 verdict_state: None,
+                slo: None,
             },
         ];
         let text = render(&tm);
@@ -835,6 +897,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
 
@@ -860,6 +923,7 @@ mod tests {
             stats: &stats,
             last_success: Some(&ok),
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
 
@@ -896,6 +960,7 @@ mod tests {
             stats: &stats,
             last_success: Some(&p),
             verdict_state: None,
+            slo: None,
         }];
         render(&tm)
     }
@@ -987,6 +1052,7 @@ mod tests {
             stats: &stats,
             last_success: Some(&ok),
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         assert!(!text.contains("httprove_tls_info"), "got:\n{text}");
@@ -1048,6 +1114,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         assert!(!text.contains("httprove_cert_chain_depth"));
@@ -1089,6 +1156,7 @@ mod tests {
             stats: &stats,
             last_success: Some(&reused),
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         let t = r#"target="https://example.com/""#;
@@ -1114,6 +1182,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         // counter는 stats 기반이라 0이라도 출력(단조 시작점).
@@ -1141,6 +1210,7 @@ mod tests {
             stats: &stats,
             last_success: Some(&p),
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         let t = r#"target="https://example.com/""#;
@@ -1160,6 +1230,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         // counter는 stats 기반이라 0이라도 출력, gauge는 last_success 없으면 생략.
@@ -1180,6 +1251,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: Some(VerdictState::Degraded),
+            slo: None,
         }];
         let text = render(&tm);
         let t = r#"target="https://example.com/""#;
@@ -1203,6 +1275,7 @@ mod tests {
             stats: &stats,
             last_success: None,
             verdict_state: None,
+            slo: None,
         }];
         let text = render(&tm);
         assert!(!text.contains("httprove_verdict_state"));
@@ -1218,18 +1291,21 @@ mod tests {
                 stats: &s,
                 last_success: None,
                 verdict_state: Some(VerdictState::Pass),
+                slo: None,
             },
             TargetMetrics {
                 target: "https://b.example/",
                 stats: &s,
                 last_success: None,
                 verdict_state: Some(VerdictState::Degraded),
+                slo: None,
             },
             TargetMetrics {
                 target: "https://c.example/",
                 stats: &s,
                 last_success: None,
                 verdict_state: Some(VerdictState::Down),
+                slo: None,
             },
         ];
         let text = render(&tm);
@@ -1261,12 +1337,14 @@ mod tests {
                 stats: &sa,
                 last_success: None,
                 verdict_state: None,
+                slo: None,
             },
             TargetMetrics {
                 target: "https://b.example/",
                 stats: &sb,
                 last_success: None,
                 verdict_state: None,
+                slo: None,
             },
         ];
         let text = render(&tm);
@@ -1279,5 +1357,95 @@ mod tests {
         assert!(text.contains(
             r#"httprove_fleet_phase_milliseconds{phase="total",stat="p50",agg="best"} 10"#
         ));
+    }
+
+    // === v0.3 트랙2: stddev 패치 / B3(Apdex) / B4(SLO) ===
+
+    #[test]
+    fn stddev_now_in_phase_output() {
+        // stddev가 STAT_ORDER에 포함돼 text와 동일하게 prom에도 노출되는지(트랙1 불일치 수정).
+        let target = "https://example.com/";
+        let mut stats = StatsCollector::new();
+        stats.record(&ok_probe(target, 0, 10.0, false, 0));
+        stats.record(&ok_probe(target, 1, 20.0, false, 0));
+        let tm = [TargetMetrics {
+            target,
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: None,
+        }];
+        let text = render(&tm);
+        assert!(
+            text.contains(r#"phase="total",stat="stddev""#),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn b3_apdex_counters_rendered_when_enabled() {
+        let target = "https://example.com/";
+        let mut stats = StatsCollector::with_apdex_threshold(Some(100.0));
+        stats.record(&ok_probe(target, 0, 50.0, false, 0)); // satisfied
+        stats.record(&ok_probe(target, 1, 300.0, false, 0)); // tolerating
+        let tm = [TargetMetrics {
+            target,
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: None,
+        }];
+        let text = render(&tm);
+        let t = r#"target="https://example.com/""#;
+        assert!(
+            text.contains(&format!("httprove_apdex_satisfied_total{{{t}}} 1")),
+            "got:\n{text}"
+        );
+        assert!(text.contains(&format!("httprove_apdex_tolerating_total{{{t}}} 1")));
+    }
+
+    #[test]
+    fn b3_apdex_omitted_without_threshold() {
+        let target = "https://example.com/";
+        let mut stats = StatsCollector::new(); // threshold 없음
+        stats.record(&ok_probe(target, 0, 50.0, false, 0));
+        let tm = [TargetMetrics {
+            target,
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: None,
+        }];
+        let text = render(&tm);
+        assert!(!text.contains("httprove_apdex"));
+    }
+
+    #[test]
+    fn b4_slo_target_rendered_and_omitted() {
+        let target = "https://example.com/";
+        let stats = StatsCollector::new();
+        // Some → 노출
+        let tm = [TargetMetrics {
+            target,
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: Some(0.999),
+        }];
+        assert!(
+            render(&tm)
+                .contains(r#"httprove_slo_target_ratio{target="https://example.com/"} 0.999"#),
+            "got:\n{}",
+            render(&tm)
+        );
+        // None → 생략
+        let tm2 = [TargetMetrics {
+            target,
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: None,
+        }];
+        assert!(!render(&tm2).contains("httprove_slo_target_ratio"));
     }
 }

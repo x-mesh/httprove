@@ -244,6 +244,8 @@ async fn run(args: Args, color: bool) -> anyhow::Result<ExitCode> {
         cert_warn_days: args.cert_warn,
         warn,
         show_target: cfgs.len() > 1,
+        slo: args.slo,
+        apdex_threshold: args.apdex_threshold,
     };
 
     // exporter 모드: 무한 프로브 + /metrics HTTP 서버.
@@ -293,7 +295,7 @@ async fn run_cli_mode(
         .iter()
         .map(|c| TargetState {
             name: c.url.to_string(),
-            stats: StatsCollector::new(),
+            stats: StatsCollector::with_apdex_threshold(out_cfg.apdex_threshold),
             last_success: None,
             latest_state: None,
         })
@@ -450,6 +452,7 @@ async fn run_cli_mode(
                 stats: &t.stats,
                 last_success: t.last_success.as_ref(),
                 verdict_state: t.latest_state,
+                slo: out_cfg.slo,
             })
             .collect();
         print!("{}", output::prom::render(&metrics));

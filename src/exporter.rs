@@ -66,10 +66,19 @@ pub async fn run_exporter(
     interval: Duration,
     out_cfg: OutputConfig,
 ) -> anyhow::Result<ExitCode> {
-    // 타깃 순서대로 상태 슬롯 초기화.
+    // SLO는 설정값(Copy) — out_cfg가 update 태스크로 move되기 전에 추출해 accept 루프가 쓴다.
+    let slo = out_cfg.slo;
+    // 타깃 순서대로 상태 슬롯 초기화 (Apdex 임계 주입).
     let state: SharedState = Arc::new(Mutex::new(
         cfgs.iter()
-            .map(|c| (c.url.to_string(), StatsCollector::new(), None, None))
+            .map(|c| {
+                (
+                    c.url.to_string(),
+                    StatsCollector::with_apdex_threshold(out_cfg.apdex_threshold),
+                    None,
+                    None,
+                )
+            })
             .collect(),
     ));
 
@@ -135,7 +144,7 @@ pub async fn run_exporter(
                                     // 느린/멈춘 클라이언트로부터 태스크 보호.
                                     let _ = tokio::time::timeout(
                                         CONN_TIMEOUT,
-                                        handle_connection(stream, state),
+                                        handle_connection(stream, state, slo),
                                     )
                                     .await;
                                 });
@@ -161,7 +170,7 @@ pub async fn run_exporter(
 }
 
 /// 커넥션 1개 처리: 요청 라인 파싱 → 라우팅 → 응답 → 종료.
-async fn handle_connection(mut stream: TcpStream, state: SharedState) {
+async fn handle_connection(mut stream: TcpStream, state: SharedState, slo: Option<f64>) {
     let Some(request_line) = read_request_line(&mut stream).await else {
         // 요청 라인을 받지 못함 (EOF/읽기 오류/8KB 초과) — 응답 없이 닫는다.
         return;
@@ -179,6 +188,7 @@ async fn handle_connection(mut stream: TcpStream, state: SharedState) {
                         stats,
                         last_success: last.as_ref(),
                         verdict_state: *vstate,
+                        slo,
                     })
                     .collect();
                 prom::render(&metrics)

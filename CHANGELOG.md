@@ -16,6 +16,15 @@
   `httprove_dns_resolved_ip_count`), 최신 건강 판정(`httprove_verdict_state`), 플릿 rollup
   (`httprove_fleet_phase_milliseconds`·`httprove_target_up`·`httprove_targets_total`·
   `httprove_targets_down`). 설계 문서: `docs/v0.3-metrics-spec.md`.
+- **SLO·Apdex 메트릭** — `--slo 0.999`로 `httprove_slo_target_ratio`(burn-rate 알림 룰의 SLO
+  목표 상수를 메트릭화; burn 계산은 PromQL에 위임), `--apdex-threshold T`로
+  `httprove_apdex_satisfied_total`·`httprove_apdex_tolerating_total` 누적 카운터(latency 체감
+  Apdex를 PromQL로 복원). 트랙2 검토 문서: `docs/track2-review.md`.
+
+### Fixed
+
+- `--prom`/`--listen`의 `httprove_phase_milliseconds`에서 `stddev` stat 누락 수정 — text/TUI엔
+  나오지만 Prometheus 출력에서만 빠져 있던 불일치.
 
 ## [0.2.0] - 2026-06-14
 
