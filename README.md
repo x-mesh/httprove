@@ -176,6 +176,9 @@ curl localhost:9912/metrics
 `httprove_phase_milliseconds{target,phase,stat}`, `httprove_probes_total`,
 `httprove_cert_expiry_days`, and other per-phase percentiles are exposed as-is.
 
+Ready-to-use recording rules (availability/Apdex/SLO burn-rate/error-budget/z-score),
+alerts, and a Grafana dashboard are in [`examples/`](examples/README.md).
+
 ### Baseline comparison (detect regressions across a deploy)
 
 ```bash

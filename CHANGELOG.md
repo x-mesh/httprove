@@ -20,6 +20,9 @@
   목표 상수를 메트릭화; burn 계산은 PromQL에 위임), `--apdex-threshold T`로
   `httprove_apdex_satisfied_total`·`httprove_apdex_tolerating_total` 누적 카운터(latency 체감
   Apdex를 PromQL로 복원). 트랙2 검토 문서: `docs/track2-review.md`.
+- **메트릭 소비 번들** — `examples/`에 Prometheus recording 룰(9개)·alert 룰(11개) +
+  Grafana 대시보드(8행 25패널). httprove 메트릭으로 availability·Apdex·SLO burn-rate·
+  error-budget·TTFB p95 z-score를 PromQL로 구성한다.
 
 ### Fixed
 

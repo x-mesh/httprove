@@ -1,0 +1,206 @@
+# httprove — Prometheus recording rules
+#
+# WHY (design intent):
+#   httprove is a STATELESS SNAPSHOT exporter. Every scrape (or textfile
+#   snapshot) reports current counter totals and current gauge values; it does
+#   NOT compute time windows, rates, availability, burn rate, error budget, or
+#   z-scores itself. By design, the *time axis* belongs to Prometheus. These
+#   recording rules reconstruct the "dropped" desires (availability, Apdex,
+#   SLO burn rate, error budget, latency anomaly) purely from real httprove
+#   metrics using PromQL — that is the whole value of this bundle.
+#
+# WHAT (only real metrics/labels are used — see the inventory below):
+#   COUNTER (all {target}, except status_total {target,code}):
+#     httprove_probes_total, httprove_probe_failures_total,
+#     httprove_expect_failures_total, httprove_apdex_satisfied_total,
+#     httprove_apdex_tolerating_total, httprove_status_total{target,code}
+#   GAUGE:
+#     httprove_phase_milliseconds{target,phase,stat},
+#     httprove_slo_target_ratio{target}  (configured SLO target, e.g. 0.999)
+#
+# CONVENTIONS:
+#   - counters  -> rate()/increase() over a window
+#   - gauges    -> used directly, or avg_over_time()/stddev_over_time()
+#   - The per-target SLO is parameterized DRY via httprove_slo_target_ratio:
+#     the error-budget denominator is (1 - httprove_slo_target_ratio), joined
+#     per target with group_left so each target carries its own SLO. The
+#     vector-matching modifier is attached to the cross-metric DIVISION (vector
+#     / vector); the (1 - ...) subtraction is scalar-minus-vector and therefore
+#     carries no matching modifier (a scalar operand cannot take on()/group_*).
+#   - All recorded series keep the {target} label so downstream alerts/dashboards
+#     can slice per target.
+#
+# NOTE on division-by-zero: rate(probes_total[W]) is 0 when a target sent no
+# probes in the window; PromQL division by 0 yields no/Inf samples for that
+# target rather than an error, which is the intended "no data" behavior.
+
+groups:
+  - name: httprove
+    rules:
+      # ----------------------------------------------------------------------
+      # Availability — fraction of probes that did NOT fail at the network level.
+      # Restores availability from probes_total (sent) and probe_failures_total
+      # (network failures). 1.0 == every probe completed the network exchange.
+      # ----------------------------------------------------------------------
+      - record: httprove:availability:ratio5m
+        expr: |
+          1
+            -
+          (
+            rate(httprove_probe_failures_total[5m])
+              /
+            rate(httprove_probes_total[5m])
+          )
+
+      # ----------------------------------------------------------------------
+      # Strict availability — counts a probe as "good" only if it neither
+      # failed at the network level NOR violated an --expect assertion.
+      # This is the "correct response" ratio: network failures + expect
+      # violations are both treated as bad events over total probes sent.
+      # ----------------------------------------------------------------------
+      - record: httprove:availability_strict:ratio5m
+        expr: |
+          1
+            -
+          (
+            (
+              rate(httprove_probe_failures_total[5m])
+                +
+              rate(httprove_expect_failures_total[5m])
+            )
+              /
+            rate(httprove_probes_total[5m])
+          )
+
+      # ----------------------------------------------------------------------
+      # Apdex — user-satisfaction score over the window.
+      #   (satisfied + tolerating/2) / total
+      # satisfied = total<=T, tolerating = T<total<=4T (T = --apdex-threshold).
+      # Only meaningful when --apdex-threshold is set (otherwise the apdex
+      # counters are absent and this rule produces no series for that target).
+      # ----------------------------------------------------------------------
+      - record: httprove:apdex:ratio5m
+        expr: |
+          (
+            rate(httprove_apdex_satisfied_total[5m])
+              +
+            rate(httprove_apdex_tolerating_total[5m]) / 2
+          )
+            /
+          rate(httprove_probes_total[5m])
+
+      # ----------------------------------------------------------------------
+      # SLO burn rate — how fast the error budget is being consumed, in units
+      # of "budget-per-window". 1.0 == burning exactly at the rate that would
+      # exhaust the budget over the SLO period; >1 == burning too fast.
+      #
+      #   burn = (failure ratio over W) / (1 - slo_target_ratio)
+      #
+      # The denominator (allowed error fraction) is parameterized per target by
+      # joining httprove_slo_target_ratio with group_left on {target}, so each
+      # target uses its own configured --slo value (DRY). The matching modifier
+      # sits on the cross-metric DIVISION (vector / vector); the (1 - ...)
+      # subtraction is scalar-minus-vector and takes no matching modifier.
+      # Targets without an --slo configured emit no slo_target_ratio series and
+      # therefore get no burn-rate series — intentional.
+      #
+      # Multiple windows (5m, 30m, 1h, 6h) support multi-window/multi-burn-rate
+      # alerting (fast-burn vs slow-burn) downstream.
+      # ----------------------------------------------------------------------
+      - record: httprove:slo_burn_rate:5m
+        expr: |
+          (
+            rate(httprove_probe_failures_total[5m])
+              /
+            rate(httprove_probes_total[5m])
+          )
+            / on(target) group_left()
+          (
+            1 - httprove_slo_target_ratio
+          )
+
+      - record: httprove:slo_burn_rate:30m
+        expr: |
+          (
+            rate(httprove_probe_failures_total[30m])
+              /
+            rate(httprove_probes_total[30m])
+          )
+            / on(target) group_left()
+          (
+            1 - httprove_slo_target_ratio
+          )
+
+      - record: httprove:slo_burn_rate:1h
+        expr: |
+          (
+            rate(httprove_probe_failures_total[1h])
+              /
+            rate(httprove_probes_total[1h])
+          )
+            / on(target) group_left()
+          (
+            1 - httprove_slo_target_ratio
+          )
+
+      - record: httprove:slo_burn_rate:6h
+        expr: |
+          (
+            rate(httprove_probe_failures_total[6h])
+              /
+            rate(httprove_probes_total[6h])
+          )
+            / on(target) group_left()
+          (
+            1 - httprove_slo_target_ratio
+          )
+
+      # ----------------------------------------------------------------------
+      # Error budget remaining (28-day rolling) — fraction of the allowed error
+      # budget still unspent.
+      #   remaining = 1 - (consumed_error_fraction / allowed_error_fraction)
+      #             = 1 - (increase(failures[28d]) / increase(probes[28d]))
+      #                     / (1 - slo_target_ratio)
+      # 1.0 == full budget; 0 == budget exhausted; <0 == over budget.
+      # Uses increase() (cumulative over the SLO window) rather than rate(), and
+      # joins the per-target SLO denominator via group_left on {target}. As with
+      # the burn-rate rules, the matching modifier is attached to the cross-
+      # metric division; the (1 - ...) subtraction is scalar-minus-vector.
+      # ----------------------------------------------------------------------
+      - record: httprove:error_budget_remaining:28d
+        expr: |
+          1
+            -
+          (
+            (
+              increase(httprove_probe_failures_total[28d])
+                /
+              increase(httprove_probes_total[28d])
+            )
+              / on(target) group_left()
+            (
+              1 - httprove_slo_target_ratio
+            )
+          )
+
+      # ----------------------------------------------------------------------
+      # Latency z-score — TTFB p95 anomaly detection.
+      # httprove exposes TTFB p95 as a stateless gauge
+      # (httprove_phase_milliseconds{phase="ttfb",stat="p95"}). The dropped
+      # "is this latency unusual?" signal is restored as a z-score against the
+      # gauge's own trailing 1h distribution:
+      #   z = (current - avg_over_time[1h]) / stddev_over_time[1h]
+      # z>0 == slower than the recent baseline; |z|>=3 is a strong outlier.
+      # When stddev over the window is 0 (perfectly flat), the division yields
+      # no/Inf samples — expected for a non-varying series.
+      # ----------------------------------------------------------------------
+      - record: httprove:latency_zscore:ttfb_p95
+        expr: |
+          (
+            httprove_phase_milliseconds{phase="ttfb",stat="p95"}
+              -
+            avg_over_time(httprove_phase_milliseconds{phase="ttfb",stat="p95"}[1h])
+          )
+            /
+          stddev_over_time(httprove_phase_milliseconds{phase="ttfb",stat="p95"}[1h])
+

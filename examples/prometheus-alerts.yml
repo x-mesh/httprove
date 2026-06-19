@@ -1,0 +1,238 @@
+# httprove — Prometheus alerting rules
+#
+# Group: httprove-alerts
+#
+# These alerts consume the raw `httprove_*` metrics exposed by httprove
+# (via `--prom` textfile snapshots or the `--listen` exporter /metrics) plus a
+# small set of recording rules (`httprove:*` series). httprove is a STATELESS
+# snapshot tool: it never computes rates, time windows, availability, burn rate,
+# or z-scores itself — Prometheus does, in the rules below.
+#
+# ── Recording-rule contract (required by the SLO/Apdex/anomaly alerts) ─────────
+# The following `httprove:*` series MUST be produced by a companion recording
+# rules file. Reference implementation (drop into a `httprove-recording` group):
+#
+#   # Multi-window burn rate. (1 - httprove_slo_target_ratio) is the per-target
+#   # error budget, sourced DRY from the exported SLO gauge so each target's SLO
+#   # parameterizes its own burn threshold.
+#   - record: httprove:error_ratio:rate5m
+#     expr: |
+#       sum by (target) (rate(httprove_probe_failures_total[5m]))
+#       /
+#       clamp_min(sum by (target) (rate(httprove_probes_total[5m])), 1)
+#   - record: httprove:error_ratio:rate1h
+#     expr: |
+#       sum by (target) (rate(httprove_probe_failures_total[1h]))
+#       /
+#       clamp_min(sum by (target) (rate(httprove_probes_total[1h])), 1)
+#   - record: httprove:error_ratio:rate6h
+#     expr: |
+#       sum by (target) (rate(httprove_probe_failures_total[6h]))
+#       /
+#       clamp_min(sum by (target) (rate(httprove_probes_total[6h])), 1)
+#   - record: httprove:error_ratio:rate3d
+#     expr: |
+#       sum by (target) (rate(httprove_probe_failures_total[3d]))
+#       /
+#       clamp_min(sum by (target) (rate(httprove_probes_total[3d])), 1)
+#   # burn rate = observed error ratio / error budget; error budget = 1 - SLO.
+#   - record: httprove:slo_burn_rate:5m
+#     expr: |
+#       httprove:error_ratio:rate5m
+#       / on (target) (1 - httprove_slo_target_ratio)
+#   - record: httprove:slo_burn_rate:1h
+#     expr: |
+#       httprove:error_ratio:rate1h
+#       / on (target) (1 - httprove_slo_target_ratio)
+#   - record: httprove:slo_burn_rate:6h
+#     expr: |
+#       httprove:error_ratio:rate6h
+#       / on (target) (1 - httprove_slo_target_ratio)
+#   - record: httprove:slo_burn_rate:3d
+#     expr: |
+#       httprove:error_ratio:rate3d
+#       / on (target) (1 - httprove_slo_target_ratio)
+#   # Apdex over 5m: (satisfied + tolerating/2) / total. Only emitted when
+#   # --apdex-threshold is set (the apdex counters exist only then).
+#   - record: httprove:apdex:ratio5m
+#     expr: |
+#       (
+#         sum by (target) (rate(httprove_apdex_satisfied_total[5m]))
+#         + sum by (target) (rate(httprove_apdex_tolerating_total[5m])) / 2
+#       )
+#       /
+#       clamp_min(sum by (target) (rate(httprove_probes_total[5m])), 1)
+#   # ttfb p95 z-score vs its own 1h baseline (gauge → avg/stddev_over_time).
+#   - record: httprove:latency_zscore:ttfb_p95
+#     expr: |
+#       (
+#         httprove_phase_milliseconds{phase="ttfb",stat="p95"}
+#         - avg_over_time(httprove_phase_milliseconds{phase="ttfb",stat="p95"}[1h])
+#       )
+#       /
+#       clamp_min(stddev_over_time(httprove_phase_milliseconds{phase="ttfb",stat="p95"}[1h]), 1)
+#
+# Multi-window multi-burn-rate thresholds below follow the Google SRE workbook
+# for a 99.9% SLO (fast: 14.4x over 5m+1h; slow: 6x over 6h+3d).
+# ──────────────────────────────────────────────────────────────────────────────
+
+groups:
+  - name: httprove-alerts
+    rules:
+      # ── Availability ────────────────────────────────────────────────────────
+      - alert: TargetDown
+        expr: httprove_target_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.target }} is DOWN"
+          description: >-
+            httprove reports {{ $labels.target }} as down (httprove_target_up == 0)
+            for more than 2 minutes. The latest probe verdict is `down`
+            (network failure or hard error on the final hop).
+
+      - alert: FleetTargetsDown
+        expr: httprove_targets_down > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} httprove target(s) are DOWN fleet-wide"
+          description: >-
+            httprove_targets_down is {{ $value }} (out of httprove_targets_total).
+            One or more monitored targets have a `down` verdict in the latest
+            snapshot. Check the per-target TargetDown alerts for specifics.
+
+      # ── TLS / certificate ───────────────────────────────────────────────────
+      - alert: CertExpiringSoon
+        expr: httprove_cert_weakest_expiry_days < 14
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate chain for {{ $labels.target }} expires in {{ $value }}d"
+          description: >-
+            The weakest link in the certificate chain for {{ $labels.target }}
+            has {{ $value }} day(s) left (httprove_cert_weakest_expiry_days).
+            This inspects the whole chain, not just the leaf, so it catches an
+            intermediate expiring before the leaf. A negative value means a link
+            has already expired. Renew before expiry.
+
+      - alert: CertExpired
+        expr: httprove_cert_weakest_expiry_days < 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Certificate chain for {{ $labels.target }} has EXPIRED"
+          description: >-
+            httprove_cert_weakest_expiry_days for {{ $labels.target }} is
+            {{ $value }} (negative). At least one certificate in the chain is
+            already expired; clients will fail TLS verification.
+
+      - alert: CertChainIncomplete
+        expr: httprove_cert_chain_incomplete == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Incomplete certificate chain served by {{ $labels.target }}"
+          description: >-
+            {{ $labels.target }} appears to serve an incomplete certificate chain
+            (httprove_cert_chain_incomplete == 1): an intermediate certificate is
+            likely missing. Some clients without cached intermediates will fail to
+            verify. Configure the server to send the full chain.
+
+      - alert: TLSDowngrade
+        expr: httprove_tls_info{version="TLSv1.2"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} negotiated TLSv1.2 instead of TLSv1.3"
+          description: >-
+            httprove observed {{ $labels.target }} negotiating
+            {{ $labels.version }} (cipher {{ $labels.cipher }}, kx
+            {{ $labels.kx_group }}, alpn {{ $labels.alpn }}). Expected TLSv1.3.
+            Investigate a possible downgrade, stale TLS config, or interception.
+
+      # ── SLO burn rate (multi-window multi-burn-rate, Google SRE) ─────────────
+      - alert: SLOFastBurn
+        expr: |
+          (
+            httprove:slo_burn_rate:5m > 14.4
+            and
+            httprove:slo_burn_rate:1h > 14.4
+          )
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fast error-budget burn on {{ $labels.target }}"
+          description: >-
+            {{ $labels.target }} is burning its SLO error budget at
+            {{ printf "%.1f" $value }}x over both the 5m and 1h windows
+            (threshold 14.4x). At this rate ~2% of the monthly budget is consumed
+            within ~1h. Budget is derived from httprove_slo_target_ratio
+            (1 - SLO). Page now.
+
+      - alert: SLOSlowBurn
+        expr: |
+          (
+            httprove:slo_burn_rate:6h > 6
+            and
+            httprove:slo_burn_rate:3d > 6
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow error-budget burn on {{ $labels.target }}"
+          description: >-
+            {{ $labels.target }} is burning its SLO error budget at
+            {{ printf "%.1f" $value }}x over both the 6h and 3d windows
+            (threshold 6x). Sustained slow burn will exhaust the budget within
+            days. Budget is derived from httprove_slo_target_ratio (1 - SLO).
+
+      # ── Latency / quality of experience ─────────────────────────────────────
+      - alert: ApdexDegraded
+        expr: httprove:apdex:ratio5m < 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Apdex degraded for {{ $labels.target }} ({{ printf \"%.2f\" $value }})"
+          description: >-
+            The 5m Apdex score for {{ $labels.target }} is
+            {{ printf "%.2f" $value }} (< 0.90). Too many probes exceed the
+            satisfied/tolerating thresholds set by --apdex-threshold. Users are
+            experiencing slow responses.
+
+      - alert: LatencyAnomaly
+        expr: httprove:latency_zscore:ttfb_p95 > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTFB p95 anomaly on {{ $labels.target }} ({{ printf \"%.1f\" $value }}σ)"
+          description: >-
+            The TTFB p95 for {{ $labels.target }} is
+            {{ printf "%.1f" $value }} standard deviations above its 1h baseline
+            (httprove:latency_zscore:ttfb_p95 > 3). Latency has spiked well
+            outside normal variation — investigate backend or network regression.
+
+      # ── DNS ─────────────────────────────────────────────────────────────────
+      - alert: DNSAnswerChanged
+        expr: increase(httprove_dns_answer_changed_total[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Resolved IP set changed for {{ $labels.target }}"
+          description: >-
+            The set of resolved IPs for {{ $labels.target }} changed
+            {{ $value }} time(s) in the last 10m
+            (increase(httprove_dns_answer_changed_total[10m]) > 0). This may be a
+            routine DNS rotation/failover, or an unexpected record change —
+            verify it was intended.
+
