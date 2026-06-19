@@ -156,6 +156,18 @@ pub struct StatsCollector {
     /// Phase::idx() 순서의 단계별 누적기.
     phases: [PhaseAccum; 6],
     status_counts: BTreeMap<u16, u64>,
+    /// goodput(bytes/s) 분포 누적기 (합산 바디>=4096 & download_ms>0 인 성공 프로브만). B7.
+    throughput: PhaseAccum,
+    /// 성공 프로브에서 관측한 전체 hop 수. B9.
+    hops_total: u64,
+    /// 그중 keep-alive 연결을 재사용한 hop 수. B9.
+    hops_reused: u64,
+    /// hop별 HTTP 버전(정규화 슬러그) 분포. B9.
+    http_version_counts: BTreeMap<String, u64>,
+    /// 직전 성공 프로브의 정렬된 resolved IP 집합 (answer-changed 비교용). B11.
+    last_sorted_ips: Option<Vec<String>>,
+    /// 직전 대비 resolved IP 집합이 바뀐 누적 횟수. B11.
+    dns_answer_changes: u64,
 }
 
 impl StatsCollector {
@@ -181,6 +193,34 @@ impl StatsCollector {
             *self.status_counts.entry(status).or_insert(0) += 1;
         }
 
+        // B9: hop 단위 연결 재사용/HTTP 버전 분포. 성공 프로브의 모든 hop을 1회 순회한다.
+        self.hops_total += result.hops.len() as u64;
+        for hop in &result.hops {
+            if hop.reused_conn {
+                self.hops_reused += 1;
+            }
+            *self
+                .http_version_counts
+                .entry(normalize_http_version(&hop.http_version))
+                .or_insert(0) += 1;
+        }
+
+        // B11: resolved IP 집합 변경 감지. 정렬 후 비교해 round-robin 순서 변동은 무시한다.
+        // 빈 집합(연결 미수립 등)은 baseline 갱신/비교에서 제외 — 의미 있는 변경으로 보지 않는다.
+        let mut cur_ips: Vec<String> = result
+            .final_hop()
+            .map(|h| h.resolved_ips.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        cur_ips.sort();
+        if !cur_ips.is_empty() {
+            if let Some(prev) = &self.last_sorted_ips
+                && *prev != cur_ips
+            {
+                self.dns_answer_changes += 1;
+            }
+            self.last_sorted_ips = Some(cur_ips); // 첫 관측은 baseline만(증가 없음).
+        }
+
         // 리다이렉트 hop 합산 시간 기준으로 단계별 기록.
         let t = result.summed_timings();
         if let Some(v) = t.dns_ms {
@@ -199,6 +239,14 @@ impl StatsCollector {
         self.phases[Phase::Ttfb.idx()].push(t.ttfb_ms);
         self.phases[Phase::Download.idx()].push(t.download_ms);
         self.phases[Phase::Total.idx()].push(t.total_ms);
+
+        // B7: goodput(bytes/s) 분포. 작은 바디의 download_ms 노이즈를 피하려 합산 바디
+        // 4096B 이상 + download_ms>0 인 프로브만 반영한다. body/download는 둘 다 전체 hop 합.
+        const MIN_GOODPUT_BODY_BYTES: u64 = 4096;
+        let body: u64 = result.hops.iter().map(|h| h.body_bytes).sum();
+        if body >= MIN_GOODPUT_BODY_BYTES && t.download_ms > 0.0 {
+            self.throughput.push(body as f64 / (t.download_ms / 1000.0)); // bytes/s
+        }
     }
 
     /// 보낸 프로브 수 (성공 + 실패).
@@ -238,9 +286,52 @@ impl StatsCollector {
         &self.status_counts
     }
 
+    /// goodput(bytes/s) 분포. 임계를 통과한 성공 프로브가 없으면 None. B7.
+    pub fn throughput_stats(&self) -> Option<PhaseStats> {
+        self.throughput.snapshot()
+    }
+
+    /// 성공 프로브에서 관측한 전체 hop 수. B9.
+    pub fn hops_total(&self) -> u64 {
+        self.hops_total
+    }
+
+    /// 그중 keep-alive 연결을 재사용한 hop 수. B9.
+    pub fn hops_reused(&self) -> u64 {
+        self.hops_reused
+    }
+
+    /// hop별 HTTP 버전(정규화 슬러그) 분포. B9.
+    pub fn http_version_counts(&self) -> &BTreeMap<String, u64> {
+        &self.http_version_counts
+    }
+
+    /// 직전 프로브 대비 resolved IP 집합이 바뀐 누적 횟수. B11.
+    pub fn dns_answer_changes(&self) -> u64 {
+        self.dns_answer_changes
+    }
+
     /// 모든 누적치 초기화 (TUI의 r 키).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+/// HTTP 버전 문자열을 Prometheus 레이블용 슬러그로 정규화한다. B9.
+/// probe.rs의 http_version_str가 반환하는 6종(HTTP/0.9|1.0|1.1|2|3|?)을 모두 커버하며,
+/// 알 수 없는 형식은 "unknown"으로 접는다(라벨 카디널리티 방어).
+fn normalize_http_version(v: &str) -> String {
+    match v {
+        "HTTP/2" => "http2".to_string(),
+        "HTTP/1.1" => "http1.1".to_string(),
+        "HTTP/1.0" => "http1.0".to_string(),
+        "HTTP/3" => "http3".to_string(),
+        "HTTP/0.9" => "http0.9".to_string(),
+        "HTTP/?" => "unknown".to_string(),
+        other => other
+            .strip_prefix("HTTP/")
+            .map(|rest| format!("http{rest}"))
+            .unwrap_or_else(|| "unknown".to_string()),
     }
 }
 
@@ -430,5 +521,137 @@ mod tests {
         // 백분위 창은 최근 샘플(전부 100.0)만 반영.
         assert_eq!(s.p50, 100.0);
         assert_eq!(s.p99, 100.0);
+    }
+
+    // === v0.3 PR-2: B7(throughput) / B9(reuse·version) / B11(dns answer-changed) ===
+
+    #[test]
+    fn b7_goodput_accumulates_above_threshold() {
+        let mut stats = StatsCollector::new();
+        // body 10000, download 10ms → 10000 / 0.01s = 1_000_000 bytes/s.
+        let mut p = ok_probe(0, 50.0, true);
+        p.hops[0].body_bytes = 10_000;
+        p.hops[0].timings.download_ms = 10.0;
+        stats.record(&p);
+        let tp = stats.throughput_stats().unwrap();
+        assert_eq!(tp.count, 1);
+        assert!((tp.min - 1_000_000.0).abs() < 1e-6, "got {}", tp.min);
+    }
+
+    #[test]
+    fn b7_small_body_and_zero_download_are_skipped() {
+        let mut stats = StatsCollector::new();
+        // 작은 바디(<4096) → 노이즈 회피로 제외.
+        let mut small = ok_probe(0, 10.0, true);
+        small.hops[0].body_bytes = 100;
+        stats.record(&small);
+        assert!(stats.throughput_stats().is_none());
+        // download_ms=0 → 분모 0이라 제외.
+        let mut zero = ok_probe(1, 10.0, true);
+        zero.hops[0].body_bytes = 8192;
+        zero.hops[0].timings.download_ms = 0.0;
+        stats.record(&zero);
+        assert!(stats.throughput_stats().is_none());
+    }
+
+    #[test]
+    fn b7_threshold_is_summed_over_hops() {
+        // 임계는 per-hop이 아니라 합산 기준: 작은 hop 2개 합(5000)이 4096 이상이면 집계.
+        let mut stats = StatsCollector::new();
+        let mut p = ok_probe(0, 20.0, true);
+        let base = p.hops[0].clone();
+        p.hops = vec![base.clone(), base];
+        p.hops[0].body_bytes = 3000;
+        p.hops[1].body_bytes = 2000;
+        stats.record(&p);
+        assert!(stats.throughput_stats().is_some());
+    }
+
+    #[test]
+    fn b9_reuse_and_version_counts() {
+        let mut stats = StatsCollector::new();
+        stats.record(&ok_probe(0, 10.0, true)); // 새 연결, HTTP/1.1
+        let mut reused = ok_probe(1, 8.0, true);
+        reused.hops[0].reused_conn = true;
+        reused.hops[0].http_version = "HTTP/2".to_string();
+        stats.record(&reused);
+
+        assert_eq!(stats.hops_total(), 2);
+        assert_eq!(stats.hops_reused(), 1);
+        assert_eq!(stats.http_version_counts().get("http1.1"), Some(&1));
+        assert_eq!(stats.http_version_counts().get("http2"), Some(&1));
+    }
+
+    #[test]
+    fn b9_failed_probe_excluded_from_hop_counts() {
+        let mut stats = StatsCollector::new();
+        stats.record(&ok_probe(0, 10.0, true));
+        stats.record(&failed_probe(1));
+        assert_eq!(stats.hops_total(), 1); // 실패 프로브 hop은 미집계.
+        assert_eq!(stats.http_version_counts().values().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn b9_normalize_http_version_covers_all_variants() {
+        assert_eq!(normalize_http_version("HTTP/2"), "http2");
+        assert_eq!(normalize_http_version("HTTP/1.1"), "http1.1");
+        assert_eq!(normalize_http_version("HTTP/1.0"), "http1.0");
+        assert_eq!(normalize_http_version("HTTP/3"), "http3");
+        assert_eq!(normalize_http_version("HTTP/0.9"), "http0.9");
+        assert_eq!(normalize_http_version("HTTP/?"), "unknown");
+        assert_eq!(normalize_http_version("garbage"), "unknown");
+    }
+
+    #[test]
+    fn b11_answer_changed_counts_set_changes_not_order() {
+        let mut stats = StatsCollector::new();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 첫 관측: baseline만(증가 0).
+        let mut p0 = ok_probe(0, 10.0, true);
+        p0.hops[0].resolved_ips = vec![ip("1.1.1.1"), ip("2.2.2.2")];
+        stats.record(&p0);
+        assert_eq!(stats.dns_answer_changes(), 0);
+        // 순서만 바뀜 → sort 후 동일 → 변경 아님.
+        let mut p1 = ok_probe(1, 10.0, true);
+        p1.hops[0].resolved_ips = vec![ip("2.2.2.2"), ip("1.1.1.1")];
+        stats.record(&p1);
+        assert_eq!(stats.dns_answer_changes(), 0);
+        // 집합 변경 → +1.
+        let mut p2 = ok_probe(2, 10.0, true);
+        p2.hops[0].resolved_ips = vec![ip("3.3.3.3")];
+        stats.record(&p2);
+        assert_eq!(stats.dns_answer_changes(), 1);
+    }
+
+    #[test]
+    fn b11_empty_ips_do_not_pollute_baseline() {
+        let mut stats = StatsCollector::new();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut p0 = ok_probe(0, 10.0, true);
+        p0.hops[0].resolved_ips = vec![ip("1.1.1.1")];
+        stats.record(&p0);
+        // 빈 집합 프로브: baseline 미오염, 비교 스킵.
+        stats.record(&ok_probe(1, 10.0, true)); // resolved_ips = vec![]
+        assert_eq!(stats.dns_answer_changes(), 0);
+        // baseline은 여전히 1.1.1.1 → 같은 IP 재관측은 변경 아님.
+        let mut p2 = ok_probe(2, 10.0, true);
+        p2.hops[0].resolved_ips = vec![ip("1.1.1.1")];
+        stats.record(&p2);
+        assert_eq!(stats.dns_answer_changes(), 0);
+    }
+
+    #[test]
+    fn pr2_reset_clears_new_accumulators() {
+        let mut stats = StatsCollector::new();
+        let mut p = ok_probe(0, 10.0, true);
+        p.hops[0].body_bytes = 8192;
+        p.hops[0].resolved_ips = vec!["1.1.1.1".parse().unwrap()];
+        stats.record(&p);
+        stats.reset();
+        assert!(stats.throughput_stats().is_none());
+        assert_eq!(stats.hops_total(), 0);
+        assert_eq!(stats.hops_reused(), 0);
+        assert!(stats.http_version_counts().is_empty());
+        assert_eq!(stats.dns_answer_changes(), 0);
     }
 }

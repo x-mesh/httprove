@@ -2,6 +2,21 @@
 
 [Keep a Changelog](https://keepachangelog.com/) 형식. 버전은 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Prometheus 메트릭 17종 확장** (`--prom`/`--listen`) — 기존 숫자 외에 진단 신호를 메트릭으로
+  노출한다. 인증서 체인 깊이/완결성/최약링크 만료(`httprove_cert_chain_depth`·`_incomplete`·
+  `httprove_cert_weakest_expiry_days`, leaf만 보던 `cert_expiry_days`의 갭 보완), 협상 TLS
+  정보(`httprove_tls_info`), 서버 Server-Timing 분해(`httprove_server_timing_milliseconds`),
+  goodput 분포(`httprove_throughput_bytes_per_second`), 연결 재사용률·HTTP 버전 분포
+  (`httprove_connection_reuse_ratio`·`httprove_hops_total`·`httprove_connection_reused_total`·
+  `httprove_http_version_total`), DNS 응답 변경·IP 수(`httprove_dns_answer_changed_total`·
+  `httprove_dns_resolved_ip_count`), 최신 건강 판정(`httprove_verdict_state`), 플릿 rollup
+  (`httprove_fleet_phase_milliseconds`·`httprove_target_up`·`httprove_targets_total`·
+  `httprove_targets_down`). 설계 문서: `docs/v0.3-metrics-spec.md`.
+
 ## [0.2.0] - 2026-06-14
 
 숫자를 보여주는 데서 그치지 않고 "어디가·왜 문제인지"를 판정하는 심층 진단 기능 16종.

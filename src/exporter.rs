@@ -30,7 +30,7 @@ use crate::output::prom::{self, TargetMetrics};
 use crate::output::{self, OutputConfig};
 use crate::runner;
 use crate::stats::StatsCollector;
-use crate::types::{ProbeConfig, ProbeResult};
+use crate::types::{ProbeConfig, ProbeResult, VerdictState};
 
 /// 요청 헤드 최대 수신 크기.
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
@@ -46,8 +46,18 @@ const MAX_CONNECTIONS: usize = 64;
 /// 코어를 태우고 같은 런타임의 프로브/업데이트 태스크를 굶기게 된다.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-/// 타깃별 공유 상태: (타깃 URL, 누적 통계, 마지막 성공 결과). 타깃 순서 보존.
-type SharedState = Arc<Mutex<Vec<(String, StatsCollector, Option<ProbeResult>)>>>;
+/// 타깃별 공유 상태: (타깃 URL, 누적 통계, 마지막 성공 결과, 최신 결과의 health 판정).
+/// 마지막 필드는 B12/B13 메트릭용 — 매 결과(성공/실패)마다 갱신한다. 타깃 순서 보존.
+type SharedState = Arc<
+    Mutex<
+        Vec<(
+            String,
+            StatsCollector,
+            Option<ProbeResult>,
+            Option<VerdictState>,
+        )>,
+    >,
+>;
 
 /// exporter 모드 실행. Ctrl-C까지 블로킹.
 pub async fn run_exporter(
@@ -59,7 +69,7 @@ pub async fn run_exporter(
     // 타깃 순서대로 상태 슬롯 초기화.
     let state: SharedState = Arc::new(Mutex::new(
         cfgs.iter()
-            .map(|c| (c.url.to_string(), StatsCollector::new(), None))
+            .map(|c| (c.url.to_string(), StatsCollector::new(), None, None))
             .collect(),
     ));
 
@@ -80,12 +90,23 @@ pub async fn run_exporter(
     // rx가 닫히면(모든 프로브 태스크 종료) 자연 종료된다.
     let update_state = Arc::clone(&state);
     let update_task = tokio::spawn(async move {
+        // B12/B13 판정 컨텍스트(임계/cert). 매 결과를 최신 판정으로 갱신하는 데 쓴다.
+        let vctx = crate::verdict::VerdictContext {
+            warn: out_cfg.warn,
+            cert_warn_days: out_cfg.cert_warn_days,
+            baseline_total_ms: None,
+        };
         while let Some(result) = rx.recv().await {
             {
                 // Mutex poisoning은 무시하고 내부 데이터를 계속 사용한다.
                 let mut slots = update_state.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(slot) = slots.iter_mut().find(|(name, _, _)| *name == result.target) {
+                if let Some(slot) = slots
+                    .iter_mut()
+                    .find(|(name, _, _, _)| *name == result.target)
+                {
                     slot.1.record(&result);
+                    // 최신 결과(성공/실패) 기준 판정 — 실패면 Down으로 반영된다.
+                    slot.3 = Some(crate::verdict::assess(&result, &vctx).state);
                     if result.is_success() {
                         slot.2 = Some(result.clone());
                     }
@@ -153,10 +174,11 @@ async fn handle_connection(mut stream: TcpStream, state: SharedState) {
                 let slots = state.lock().unwrap_or_else(|e| e.into_inner());
                 let metrics: Vec<TargetMetrics<'_>> = slots
                     .iter()
-                    .map(|(name, stats, last)| TargetMetrics {
+                    .map(|(name, stats, last, vstate)| TargetMetrics {
                         target: name,
                         stats,
                         last_success: last.as_ref(),
+                        verdict_state: *vstate,
                     })
                     .collect();
                 prom::render(&metrics)

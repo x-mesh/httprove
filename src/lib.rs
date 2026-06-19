@@ -275,6 +275,9 @@ struct TargetState {
     name: String,
     stats: StatsCollector,
     last_success: Option<ProbeResult>,
+    /// 최신 결과(error 포함)의 health 판정. B12/B13 메트릭용 — last_success가 아니라
+    /// 매 결과마다 갱신해 실패를 Down으로 반영한다. 결과 수신 전이면 None.
+    latest_state: Option<types::VerdictState>,
 }
 
 /// 단발/핑 모드 공용 실행부: 결과 수집 → 출력 → 요약/비교/저장 → 종료 코드.
@@ -292,6 +295,7 @@ async fn run_cli_mode(
             name: c.url.to_string(),
             stats: StatsCollector::new(),
             last_success: None,
+            latest_state: None,
         })
         .collect();
     let index: HashMap<String, usize> = targets
@@ -354,6 +358,8 @@ async fn run_cli_mode(
                    captured: &mut Vec<ProbeResult>| {
         if let Some(&i) = index.get(&result.target) {
             targets[i].stats.record(&result);
+            // 최신 결과(성공/실패) 기준 판정 — B12/B13 메트릭이 실패를 Down으로 보게 한다.
+            targets[i].latest_state = Some(verdict::assess(&result, &vctx).state);
             if result.is_success() {
                 targets[i].last_success = Some(result.clone());
             }
@@ -443,6 +449,7 @@ async fn run_cli_mode(
                 target: &t.name,
                 stats: &t.stats,
                 last_success: t.last_success.as_ref(),
+                verdict_state: t.latest_state,
             })
             .collect();
         print!("{}", output::prom::render(&metrics));
