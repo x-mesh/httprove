@@ -8,7 +8,7 @@
 //! - `httprove_probe_failures_total{target}` counter — failed (네트워크 실패)
 //! - `httprove_expect_failures_total{target}` counter — expect_failed
 //! - `httprove_phase_milliseconds{target,phase,stat}` gauge —
-//!   phase ∈ dns|tcp|tls|ttfb|download|total, stat ∈ min|mean|p50|p95|p99|max
+//!   phase ∈ dns|tcp|tls|ttfb|download|total, stat ∈ min|mean|stddev|p50|p95|p99|max
 //!   (샘플 없는 단계는 생략)
 //! - `httprove_status_total{target,code}` counter — 상태 코드 분포
 //! - `httprove_last_total_milliseconds{target}` gauge — 마지막 성공 프로브 total
@@ -55,7 +55,7 @@ pub struct TargetMetrics<'a> {
 }
 
 /// phase 게이지의 stat 레이블 출력 순서.
-const STAT_ORDER: [&str; 6] = ["min", "mean", "p50", "p95", "p99", "max"];
+const STAT_ORDER: [&str; 7] = ["min", "mean", "stddev", "p50", "p95", "p99", "max"];
 
 /// Prometheus 레이블 값 이스케이프: `\` → `\\`, `"` → `\"`, 개행 → `\n`.
 fn escape_label(value: &str) -> String {
@@ -172,7 +172,7 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
             let Some(s) = t.stats.phase_stats(phase) else {
                 continue;
             };
-            let values = [s.min, s.mean, s.p50, s.p95, s.p99, s.max];
+            let values = [s.min, s.mean, s.stddev, s.p50, s.p95, s.p99, s.max];
             for (stat, value) in STAT_ORDER.iter().zip(values) {
                 phase_lines.push(format!(
                     "httprove_phase_milliseconds{{target=\"{target}\",phase=\"{}\",stat=\"{stat}\"}} {value}",
@@ -196,7 +196,7 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
             continue;
         };
         let target = escape_label(t.target);
-        let values = [s.min, s.mean, s.p50, s.p95, s.p99, s.max];
+        let values = [s.min, s.mean, s.stddev, s.p50, s.p95, s.p99, s.max];
         for (stat, value) in STAT_ORDER.iter().zip(values) {
             throughput_lines.push(format!(
                 "httprove_throughput_bytes_per_second{{target=\"{target}\",stat=\"{stat}\"}} {value}"
@@ -537,6 +537,7 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
             match stat {
                 "min" => s.min,
                 "mean" => s.mean,
+                "stddev" => s.stddev,
                 "p50" => s.p50,
                 "p95" => s.p95,
                 "p99" => s.p99,
