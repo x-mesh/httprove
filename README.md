@@ -36,6 +36,9 @@ Total                     117.6 ms
 - **Integration** — JSON/NDJSON, Prometheus (`--prom`/`--listen`), OTLP (`--otlp`), HTML report (`--report`)
 - **Capture** — `--trap` (freeze on first failure), `--record`/`replay` (record & replay incidents)
 - **Operations** — keep-alive mode, `--resolve`, bulk certificate check (`--cert-check`), baseline comparison
+- **Security & ops diagnostics** — `--tls-grade` (A–F TLS connection scorecard), `--cache-audit`
+  (CDN HIT/MISS + cache anti-patterns), `--on-breach` (ping-mode webhook alerting),
+  `--blackbox-config` (blackbox_exporter drop-in: modules YAML + `/probe` endpoint)
 - **Two commands** — `httprove` (full)/`hpr` (short), self-update via `httprove update`
 
 ## What it measures
@@ -255,11 +258,26 @@ httprove trace https://api.example.com             # system traceroute + TLS-ter
 
 ```bash
 httprove --check-chain https://api.example.com   # missing intermediate certificate + AIA repair feasibility
+httprove --tls-grade https://api.example.com     # A–F connection grade (protocol/cipher/kx/HSTS/chain)
 httprove https://expired.example.com             # translates handshake failure into cause + fix (hint:)
 ```
 
 `--check-chain` catches incomplete chains that "work in the browser but fail in curl/Go".
 The certificate block always shows the weakest-link expiry of the whole chain (`weakest:`).
+
+### Cache · alerting · blackbox_exporter
+
+```bash
+httprove --cache-audit https://cdn.example.com   # CDN HIT/MISS, edge, age, cache-busting anti-patterns
+httprove -c 0 --on-breach https://hooks.example/alert https://api.example.com   # webhook on breach (verdict != PASS)
+httprove --blackbox-config blackbox.yml --listen :9115 placeholder.invalid      # blackbox drop-in: /probe?target=&module=
+```
+
+`--on-breach` posts a JSON alert in ping mode, debounced with `--breach-after N` / `--cooldown SECS`
+(plus `--on-recover`). `--blackbox-config` reads an existing blackbox `modules:` YAML and — with
+`--listen` — serves a compatible `/probe?target=&module=` endpoint, so existing Prometheus scrape
+configs/alerts keep working while each probe gains httprove's per-phase breakdown (the CLI target
+is a placeholder in `/probe` mode; targets come from the query).
 
 ### Change tracking · capture · integration
 
