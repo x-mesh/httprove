@@ -28,6 +28,7 @@ mod probe;
 mod record;
 mod runner;
 mod stats;
+mod tls_grade;
 mod trace;
 mod tui;
 mod types;
@@ -388,6 +389,18 @@ async fn run_cli_mode(
             }
             if args.explain {
                 println!("{}", verdict::explain(&result));
+            }
+            // TLS 연결 보안 스코어카드 (협상된 구성 + HSTS + 체인 종합 A~F).
+            if args.tls_grade
+                && let Some(hop) = result.final_hop()
+                && let Some(tls) = &hop.tls
+            {
+                let analysis = crate::chain::analyze(&hop.cert_chain);
+                let g = tls_grade::grade(tls, &hop.response_headers, &analysis);
+                println!("tls-grade: {} ({}/100) — {}", g.letter, g.score, g.summary);
+                for d in &g.deductions {
+                    println!("           - {d}");
+                }
             }
             // ㊲ --otlp: 서버가 보낸 Server-Timing(있으면)을 파싱해 표시한다.
             // (트레이스는 export_otlp가 별도로 전송하고, 여기서는 서버측 분해 시간을 노출.)

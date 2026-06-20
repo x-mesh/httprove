@@ -406,3 +406,18 @@ pub struct Fingerprint {
     /// 식별성 있는 응답 헤더 일부 (server, content-type 등).
     pub headers: Vec<(String, String)>,
 }
+
+/// TLS 연결 보안 스코어카드 (--tls-grade). `tls_grade` 모듈이 협상된 TlsInfo +
+/// 응답 헤더(HSTS) + 체인 분석(ChainAnalysis)으로 산출한다. 서버가 지원하는 모든
+/// cipher를 전수 스캔하는 testssl과 달리, **실제 협상된 이 연결**의 구성을 등급화한다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsGrade {
+    /// A~F 등급 글자 (A=최고).
+    pub letter: char,
+    /// 0~100 점수 (감점 합산 후, 0 하한).
+    pub score: i32,
+    /// 한 줄 요약 (예: "TLSv1.3, X25519, AEAD, HSTS 1y, chain OK").
+    pub summary: String,
+    /// 감점 사유 (예: "TLS 1.2 (not 1.3): -10"). 비어 있으면 만점.
+    pub deductions: Vec<String>,
+}

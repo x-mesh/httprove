@@ -23,6 +23,9 @@
 - **메트릭 소비 번들** — `examples/`에 Prometheus recording 룰(9개)·alert 룰(11개) +
   Grafana 대시보드(8행 25패널). httprove 메트릭으로 availability·Apdex·SLO burn-rate·
   error-budget·TTFB p95 z-score를 PromQL로 구성한다.
+- **TLS 연결 보안 등급** (`--tls-grade`) — 협상된 protocol/cipher(forward-secrecy·AEAD)/
+  key-exchange + HSTS + 인증서 체인(`chain::analyze` 재사용)을 종합해 A~F 등급 + 감점 사유.
+  단발 출력에 한 줄 표시. 서버 cipher 전수 스캔(testssl)이 아니라 *실제 협상된 이 연결*의 구성 등급.
 
 ### Fixed
 

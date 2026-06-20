@@ -182,6 +182,10 @@ pub struct Args {
     #[arg(long)]
     pub explain: bool,
 
+    /// Print an A–F TLS connection security grade (protocol/cipher/kx/HSTS/chain)
+    #[arg(long = "tls-grade")]
+    pub tls_grade: bool,
+
     // 조사(investigation) 모드 — 단발성, 자체 종료 코드 (standalone-ish).
     // 이 모드들은 자체 출력/종료 코드로 일찍 반환하므로, 후처리/판정 플래그를 함께 주면
     // 조용히 무시된다 — clap 단에서 거부해 사용자가 no-op 조합을 만들지 않게 한다.
