@@ -360,7 +360,8 @@ fn ms_to_nanos(ms: f64) -> u64 {
 }
 
 /// JSON 바디를 endpoint에 POST한다. http/https 모두 지원.
-async fn post_json(url: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+/// watch/alert(--on-breach webhook)도 이 헬퍼를 재사용한다.
+pub(crate) async fn post_json(url: &str, payload: Vec<u8>) -> anyhow::Result<()> {
     let uri: Uri = url
         .parse()
         .with_context(|| format!("invalid otlp url: {url}"))?;

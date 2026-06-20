@@ -190,6 +190,22 @@ pub struct Args {
     #[arg(long = "cache-audit")]
     pub cache_audit: bool,
 
+    /// Watch mode: POST a JSON alert to this URL when a probe breaches (verdict != PASS)
+    #[arg(long = "on-breach", value_name = "URL")]
+    pub on_breach: Option<String>,
+
+    /// Fire --on-breach only after N consecutive breaches
+    #[arg(long = "breach-after", default_value_t = 1, value_name = "N")]
+    pub breach_after: u32,
+
+    /// Suppress repeat --on-breach alerts for this many seconds
+    #[arg(long, default_value_t = 60.0, value_name = "SECS")]
+    pub cooldown: f64,
+
+    /// Also POST an alert when the target recovers to PASS
+    #[arg(long = "on-recover")]
+    pub on_recover: bool,
+
     // 조사(investigation) 모드 — 단발성, 자체 종료 코드 (standalone-ish).
     // 이 모드들은 자체 출력/종료 코드로 일찍 반환하므로, 후처리/판정 플래그를 함께 주면
     // 조용히 무시된다 — clap 단에서 거부해 사용자가 no-op 조합을 만들지 않게 한다.

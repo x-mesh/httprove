@@ -35,6 +35,7 @@ mod tui;
 mod types;
 mod update;
 mod verdict;
+mod watch;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -282,6 +283,8 @@ struct TargetState {
     /// 최신 결과(error 포함)의 health 판정. B12/B13 메트릭용 — last_success가 아니라
     /// 매 결과마다 갱신해 실패를 Down으로 반영한다. 결과 수신 전이면 None.
     latest_state: Option<types::VerdictState>,
+    /// C3 watch/alert: --on-breach 발화 추적 상태(연속 breach/쿨다운/복구).
+    breach: watch::BreachTracker,
 }
 
 /// 단발/핑 모드 공용 실행부: 결과 수집 → 출력 → 요약/비교/저장 → 종료 코드.
@@ -300,6 +303,7 @@ async fn run_cli_mode(
             stats: StatsCollector::with_apdex_threshold(out_cfg.apdex_threshold),
             last_success: None,
             latest_state: None,
+            breach: watch::BreachTracker::default(),
         })
         .collect();
     let index: HashMap<String, usize> = targets
@@ -352,6 +356,8 @@ async fn run_cli_mode(
         cert_warn_days: out_cfg.cert_warn_days,
         baseline_total_ms: None,
     };
+    // C3 watch/alert: --on-breach 재발화 억제 쿨다운.
+    let watch_cooldown = Duration::from_secs_f64(args.cooldown.max(0.0));
 
     let mut handle = runner::spawn_probe_loop(cfgs, count, interval);
     let mut printed_singles = 0usize;
@@ -362,8 +368,31 @@ async fn run_cli_mode(
                    captured: &mut Vec<ProbeResult>| {
         if let Some(&i) = index.get(&result.target) {
             targets[i].stats.record(&result);
-            // 최신 결과(성공/실패) 기준 판정 — B12/B13 메트릭이 실패를 Down으로 보게 한다.
-            targets[i].latest_state = Some(verdict::assess(&result, &vctx).state);
+            // 최신 결과(성공/실패) 기준 판정 — B12/B13 메트릭 + C3 watch가 공용으로 쓴다.
+            let v = verdict::assess(&result, &vctx);
+            targets[i].latest_state = Some(v.state);
+            // C3 watch/alert: ping 모드 breach/recover webhook 발화 (fire-and-forget).
+            if let Some(url) = &args.on_breach {
+                let breached = v.state != types::VerdictState::Pass;
+                let event = targets[i].breach.evaluate(
+                    breached,
+                    args.breach_after,
+                    watch_cooldown,
+                    args.on_recover,
+                    std::time::Instant::now(),
+                );
+                match event {
+                    watch::Fire::Breach => watch::fire(
+                        url.clone(),
+                        watch::payload("breach", &result, v.state, &v.headline),
+                    ),
+                    watch::Fire::Recover => watch::fire(
+                        url.clone(),
+                        watch::payload("recover", &result, v.state, &v.headline),
+                    ),
+                    watch::Fire::None => {}
+                }
+            }
             if result.is_success() {
                 targets[i].last_success = Some(result.clone());
             }

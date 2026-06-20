@@ -29,6 +29,10 @@
 - **CDN/캐시 효율 진단** (`--cache-audit`) — 응답 헤더(Cache-Control/Age/X-Cache/
   CF-Cache-Status/X-Served-By/Via)로 HIT/MISS·CDN·edge·age를 요약하고, 캐시 무력화 안티패턴
   (Set-Cookie·no-store·Vary:*·max-age=0)을 짚는다. 단발 출력에 한 줄.
+- **watch/alert 모드** (`--on-breach <url>`) — ping 모드에서 프로브가 breach(verdict != PASS)
+  하면 webhook으로 JSON 알림을 POST한다. `--breach-after N`(연속 N회 후 발화),
+  `--cooldown SECS`(재발화 억제), `--on-recover`(복구 알림). fire-and-forget이라 프로브 루프를
+  막지 않으며, exec hook은 보안상 제외하고 webhook만 지원한다.
 
 ### Fixed
 
