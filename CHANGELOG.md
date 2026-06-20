@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com/) 형식. 버전은 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-06-20
 
 ### Added
 
