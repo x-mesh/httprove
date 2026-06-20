@@ -13,6 +13,7 @@
 //! 종료 코드: 0 = 모든 프로브 통과, 1 = 네트워크 실패/실행 오류,
 //! 3 = 네트워크는 성공했지만 --expect 어설션 위반.
 
+mod cache_audit;
 mod cert;
 mod cert_check;
 mod chain;
@@ -400,6 +401,19 @@ async fn run_cli_mode(
                 println!("tls-grade: {} ({}/100) — {}", g.letter, g.score, g.summary);
                 for d in &g.deductions {
                     println!("           - {d}");
+                }
+            }
+            // CDN/캐시 효율 진단 (응답 헤더 시그널 기반).
+            if args.cache_audit
+                && let Some(hop) = result.final_hop()
+            {
+                let a = cache_audit::audit(&hop.response_headers);
+                println!("cache:     {}", a.summary);
+                if let Some(edge) = &a.edge {
+                    println!("           edge: {edge}");
+                }
+                for issue in &a.issues {
+                    println!("           - {issue}");
                 }
             }
             // ㊲ --otlp: 서버가 보낸 Server-Timing(있으면)을 파싱해 표시한다.

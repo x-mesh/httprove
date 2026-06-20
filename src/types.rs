@@ -421,3 +421,33 @@ pub struct TlsGrade {
     /// 감점 사유 (예: "TLS 1.2 (not 1.3): -10"). 비어 있으면 만점.
     pub deductions: Vec<String>,
 }
+
+/// 캐시 적중 상태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    /// 캐시 우회(동적 응답).
+    Dynamic,
+    /// 캐시 시그널 없음/판별 불가.
+    Unknown,
+}
+
+/// CDN/캐시 효율 진단 (--cache-audit). `cache_audit` 모듈이 응답 헤더로 산출한다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheAudit {
+    pub status: CacheStatus,
+    /// CDN 종류 (예: "Cloudflare", "Fastly", "CloudFront", "Varnish").
+    pub cdn: Option<String>,
+    /// 캐시 edge/POP 식별자 (있으면).
+    pub edge: Option<String>,
+    /// Age 헤더 (초).
+    pub age: Option<u64>,
+    /// Cache-Control의 s-maxage 또는 max-age (초).
+    pub max_age: Option<u64>,
+    /// 한 줄 요약.
+    pub summary: String,
+    /// 캐시를 무력화/약화하는 안티패턴 (Set-Cookie, no-store, Vary:*, max-age=0 등).
+    pub issues: Vec<String>,
+}
