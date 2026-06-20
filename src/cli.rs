@@ -206,6 +206,15 @@ pub struct Args {
     #[arg(long = "on-recover")]
     pub on_recover: bool,
 
+    /// Run probes from a blackbox_exporter modules YAML (http prober) instead of CLI flags.
+    /// With --listen, serves a blackbox-compatible /probe?target=&module= endpoint.
+    #[arg(long = "blackbox-config", value_name = "FILE")]
+    pub blackbox_config: Option<String>,
+
+    /// Blackbox module name to use (with --blackbox-config; default: http_2xx)
+    #[arg(long, value_name = "NAME")]
+    pub module: Option<String>,
+
     // 조사(investigation) 모드 — 단발성, 자체 종료 코드 (standalone-ish).
     // 이 모드들은 자체 출력/종료 코드로 일찍 반환하므로, 후처리/판정 플래그를 함께 주면
     // 조용히 무시된다 — clap 단에서 거부해 사용자가 no-op 조합을 만들지 않게 한다.

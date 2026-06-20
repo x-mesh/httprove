@@ -33,6 +33,11 @@
   하면 webhook으로 JSON 알림을 POST한다. `--breach-after N`(연속 N회 후 발화),
   `--cooldown SECS`(재발화 억제), `--on-recover`(복구 알림). fire-and-forget이라 프로브 루프를
   막지 않으며, exec hook은 보안상 제외하고 webhook만 지원한다.
+- **blackbox_exporter 호환** (`--blackbox-config <file>`) — blackbox `modules:` YAML(http
+  prober)을 httprove 프로브로 변환한다. `--listen`과 함께 쓰면 `/probe?target=&module=`
+  엔드포인트로 blackbox 메트릭(probe_success·probe_duration_seconds·probe_http_*·
+  probe_ssl_earliest_cert_expiry)을 응답 — 기존 blackbox 잡 설정·alert·dashboard를 그대로 쓰되
+  각 프로브에 httprove 단계별 진단이 붙는 drop-in 업그레이드. (의존성 추가: serde_yaml_ng)
 
 ### Fixed
 

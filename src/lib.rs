@@ -13,6 +13,7 @@
 //! 종료 코드: 0 = 모든 프로브 통과, 1 = 네트워크 실패/실행 오류,
 //! 3 = 네트워크는 성공했지만 --expect 어설션 위반.
 
+mod blackbox;
 mod cache_audit;
 mod cert;
 mod cert_check;
@@ -206,7 +207,25 @@ async fn run(args: Args, color: bool) -> anyhow::Result<ExitCode> {
         .await;
     }
 
-    let mut cfgs = args.to_probe_configs()?;
+    let mut cfgs = if let Some(bbpath) = &args.blackbox_config {
+        // blackbox_exporter modules YAML(http prober)을 ProbeConfig로 변환한다.
+        let bb = blackbox::BlackboxConfig::load(bbpath)?;
+        let module_name = args.module.as_deref().unwrap_or("http_2xx");
+        let module = bb.module(module_name).ok_or_else(|| {
+            anyhow::anyhow!("blackbox module '{module_name}' not found in {bbpath}")
+        })?;
+        anyhow::ensure!(
+            args.timeout > 0.0 && args.timeout.is_finite(),
+            "--timeout must be a positive finite number"
+        );
+        let timeout = std::time::Duration::from_secs_f64(args.timeout);
+        args.targets
+            .iter()
+            .map(|t| blackbox::to_probe_config(module, t, timeout))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        args.to_probe_configs()?
+    };
 
     // ㊲ --traceparent: 각 요청에 W3C traceparent 헤더를 주입한다.
     // 설정당 trace-id를 한 번 만들어 (1) 헤더와 (2) cfg.trace_id에 함께 저장한다 —
@@ -253,6 +272,16 @@ async fn run(args: Args, color: bool) -> anyhow::Result<ExitCode> {
 
     // exporter 모드: 무한 프로브 + /metrics HTTP 서버.
     if let Some(addr) = args.listen {
+        // blackbox config + --listen → /probe?target=&module= 엔드포인트 모드(target은 쿼리로).
+        if let Some(bbpath) = &args.blackbox_config {
+            let bb = blackbox::BlackboxConfig::load(bbpath)?;
+            let module = args
+                .module
+                .clone()
+                .unwrap_or_else(|| "http_2xx".to_string());
+            let timeout = std::time::Duration::from_secs_f64(args.timeout.max(0.001));
+            return exporter::run_blackbox_exporter(bb, addr, module, timeout).await;
+        }
         return exporter::run_exporter(cfgs, addr, interval, out_cfg).await;
     }
 

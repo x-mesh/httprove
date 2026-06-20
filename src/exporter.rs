@@ -283,3 +283,141 @@ async fn write_response(stream: &mut TcpStream, status: &str, content_type: &str
     let _ = stream.write_all(body.as_bytes()).await;
     let _ = stream.shutdown().await;
 }
+
+/// blackbox_exporter 호환 `/probe` 엔드포인트 모드. `GET /probe?target=<url>&module=<name>`으로
+/// 단발 프로브를 돌려 blackbox 메트릭을 응답한다. Prometheus가 기존 blackbox 잡 설정 그대로
+/// 스크레이프하되, 각 프로브에 httprove 진단(단계별 타이밍·TLS)이 붙는 drop-in 업그레이드.
+pub async fn run_blackbox_exporter(
+    config: crate::blackbox::BlackboxConfig,
+    listen: SocketAddr,
+    default_module: String,
+    default_timeout: Duration,
+) -> anyhow::Result<ExitCode> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind {listen}"))?;
+    let local = listener.local_addr().unwrap_or(listen);
+    eprintln!("blackbox-compatible exporter on http://{local}/probe?target=<url>&module=<name>");
+
+    let config = Arc::new(config);
+    let default_module = Arc::new(default_module);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => match Arc::clone(&conn_limit).try_acquire_owned() {
+                    Ok(permit) => {
+                        let config = Arc::clone(&config);
+                        let default_module = Arc::clone(&default_module);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            // 프로브 타임아웃 + 응답까지 넉넉히 보호(프로브 자체도 cfg.timeout 적용).
+                            let _ = tokio::time::timeout(
+                                default_timeout + Duration::from_secs(5),
+                                handle_probe_request(stream, config, default_module, default_timeout),
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => drop(stream),
+                },
+                Err(e) => {
+                    eprintln!("httprove: accept error: {e}");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `/probe` 요청 1개 처리: 쿼리(target/module) 파싱 → 단발 프로브 → blackbox 메트릭 응답.
+async fn handle_probe_request(
+    mut stream: TcpStream,
+    config: Arc<crate::blackbox::BlackboxConfig>,
+    default_module: Arc<String>,
+    default_timeout: Duration,
+) {
+    let Some(request_line) = read_request_line(&mut stream).await else {
+        return;
+    };
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(raw_path)) = (parts.next(), parts.next()) else {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain",
+            "bad request\n",
+        )
+        .await;
+        return;
+    };
+    if method != "GET" {
+        write_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain",
+            "GET only\n",
+        )
+        .await;
+        return;
+    }
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+    if path != "/probe" {
+        let body = "<html><body>httprove blackbox exporter — \
+            <a href=\"/probe?target=https://example.com&module=http_2xx\">/probe</a></body></html>\n";
+        write_response(&mut stream, "200 OK", "text/html; charset=utf-8", body).await;
+        return;
+    }
+
+    // 쿼리 파싱(URL 디코딩). target=<url>&module=<name>.
+    let mut target = None;
+    let mut module_name = None;
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        match k.as_ref() {
+            "target" => target = Some(v.into_owned()),
+            "module" => module_name = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let Some(target) = target else {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain",
+            "missing 'target' query parameter\n",
+        )
+        .await;
+        return;
+    };
+    let module_name = module_name.unwrap_or_else(|| (*default_module).clone());
+    let Some(module) = config.module(&module_name) else {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain",
+            &format!("unknown blackbox module '{module_name}'\n"),
+        )
+        .await;
+        return;
+    };
+    let cfg = match crate::blackbox::to_probe_config(module, &target, default_timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            write_response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain",
+                &format!("{e}\n"),
+            )
+            .await;
+            return;
+        }
+    };
+    let result = crate::probe::probe(&cfg, 0).await;
+    let body = crate::blackbox::render_blackbox(&result);
+    write_response(&mut stream, "200 OK", "text/plain; version=0.0.4", &body).await;
+}
