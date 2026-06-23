@@ -24,6 +24,7 @@ mod dns;
 mod exporter;
 mod fanout;
 mod hash;
+mod ipinfo;
 mod otlp;
 mod output;
 mod probe;
@@ -548,6 +549,40 @@ async fn run_cli_mode(
             }
             let last_cert = t.last_success.as_ref().and_then(|r| r.leaf_cert());
             output::text::print_summary(&t.name, &t.stats, last_cert, &out_cfg);
+        }
+    }
+
+    // IP 인텔리전스 (--asn): 각 타깃의 연결 IP를 Team Cymru DNS로 조회한다(single/ping 공용).
+    // 기계 출력(json/prom)과는 섞지 않는다.
+    if args.asn && !args.json && !args.prom {
+        let resolver: std::net::IpAddr = std::net::Ipv4Addr::new(1, 1, 1, 1).into();
+        for t in &targets {
+            let Some(last) = &t.last_success else {
+                continue;
+            };
+            let Some(hop) = last.final_hop() else {
+                continue;
+            };
+            let info = ipinfo::lookup(hop.ip, resolver).await;
+            let server = hop
+                .response_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("server"))
+                .map(|(_, v)| v.as_str());
+            let kind = ipinfo::classify(&info, server);
+            let asn = info
+                .asn
+                .map(|a| format!("AS{a}"))
+                .unwrap_or_else(|| "AS?".to_string());
+            println!(
+                "ip-info:  {} {} {} ({})  PTR: {}  [{}]",
+                hop.ip,
+                asn,
+                info.org.as_deref().unwrap_or("?"),
+                info.country.as_deref().unwrap_or("?"),
+                info.ptr.as_deref().unwrap_or("-"),
+                kind.label(),
+            );
         }
     }
 

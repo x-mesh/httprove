@@ -29,7 +29,7 @@ Total                     117.6 ms
 - **Per-phase waterfall** — splits DNS/TCP/TLS/TTFB/Download to pinpoint the bottleneck
 - **Deep TLS inspection** — version/cipher/key-exchange, chain expiry (weakest link)·SAN·issuer, handshake-failure cause decoding, chain completeness + AIA repair
 - **Health verdict** — `--verdict` gives PASS/DEGRADED/DOWN plus a one-line rationale, `--explain` for plain-language explanation
-- **Backend & path localization** — `--fanout` (per-IP), `--all-families` (v4/v6), `--via` (multi-resolver), `trace` (traceroute)
+- **Backend & path localization** — `--fanout` (per-IP), `--all-families` (v4/v6), `--via` (multi-resolver), `--asn` (IP ASN/org/country + CDN/cloud/origin), `trace` (traceroute)
 - **Change tracking** — `diff` (compare two captures), `--since-good` (fingerprint drift vs. last-known-good)
 - **Continuous monitoring** — ping mode + percentile stats, live TUI dashboard, multi-target
 - **Synthetic monitoring** — `--expect-*` assertions (exit code 3), `--warn` threshold highlighting
@@ -252,6 +252,7 @@ httprove --fanout https://api.example.com          # probe every DNS IP individu
 httprove --all-families https://api.example.com    # IPv4 vs IPv6 phase-by-phase comparison
 httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # compare response IP/POP per resolver (--ecs for client-subnet)
 httprove trace https://api.example.com             # system traceroute + TLS-terminating hop annotation
+httprove --asn https://api.example.com             # connected IP's ASN/org/country (Team Cymru) + PTR + infra (CDN/cloud/origin)
 ```
 
 ### Deep TLS trust

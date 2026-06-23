@@ -190,6 +190,10 @@ pub struct Args {
     #[arg(long = "cache-audit")]
     pub cache_audit: bool,
 
+    /// Look up ASN/org/country (Team Cymru DNS) + reverse DNS for the connected IP
+    #[arg(long)]
+    pub asn: bool,
+
     /// Watch mode: POST a JSON alert to this URL when a probe breaches (verdict != PASS)
     #[arg(long = "on-breach", value_name = "URL")]
     pub on_breach: Option<String>,

@@ -2,6 +2,15 @@
 
 [Keep a Changelog](https://keepachangelog.com/) 형식. 버전은 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **IP 인텔리전스** (`--asn`) — 연결 IP의 ASN·조직·등록국가(Team Cymru DNS)와 reverse DNS(PTR)를
+  조회하고 인프라를 CDN/cloud/origin으로 분류해 단발 출력에 한 줄로 표시한다. 자체 DNS 클라이언트
+  (dns.rs에 TXT/PTR 파서 추가)를 재사용하므로 의존성·오프라인 GeoIP DB가 없다. 예: naver=origin,
+  cloudflare=CDN, google=cloud/LB.
+
 ## [0.3.0] - 2026-06-20
 
 ### Added

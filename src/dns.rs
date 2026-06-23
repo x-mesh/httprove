@@ -55,6 +55,8 @@ use crate::types::{IpFamily, ProbeConfig};
 /// DNS 레코드 타입.
 const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
+const QTYPE_PTR: u16 = 12;
+const QTYPE_TXT: u16 = 16;
 /// EDNS0 OPT pseudo-RR 타입.
 const RR_OPT: u16 = 41;
 /// IN 클래스.
@@ -214,12 +216,13 @@ fn family_matches(ip: IpAddr, family: IpFamily) -> bool {
 }
 
 /// 단일 리졸버에 1개 레코드 타입을 질의하고 응답 IP들을 반환한다.
-async fn query_resolver(
+/// 리졸버에 한 번의 UDP 질의를 보내고 raw 응답 바이트를 받는다 (파싱은 호출자가).
+async fn query_raw(
     resolver: IpAddr,
     host: &str,
     qtype: u16,
     ecs: Option<&EcsSubnet>,
-) -> Result<Vec<IpAddr>, String> {
+) -> Result<Vec<u8>, String> {
     let query = encode_query(rand_id(), host, qtype, ecs)?;
 
     // 리졸버 패밀리에 맞는 로컬 주소로 UDP 소켓을 연다.
@@ -233,7 +236,7 @@ async fn query_resolver(
     let dst = SocketAddr::new(resolver, 53);
 
     // 송신 + 수신을 한 타임아웃 예산 안에서 처리한다.
-    let buf = tokio::time::timeout(DNS_TIMEOUT, async {
+    tokio::time::timeout(DNS_TIMEOUT, async {
         socket
             .send_to(&query, dst)
             .await
@@ -247,9 +250,29 @@ async fn query_resolver(
         Ok::<Vec<u8>, String>(buf)
     })
     .await
-    .map_err(|_| format!("dns query to {resolver} timed out"))??;
+    .map_err(|_| format!("dns query to {resolver} timed out"))?
+}
 
+async fn query_resolver(
+    resolver: IpAddr,
+    host: &str,
+    qtype: u16,
+    ecs: Option<&EcsSubnet>,
+) -> Result<Vec<IpAddr>, String> {
+    let buf = query_raw(resolver, host, qtype, ecs).await?;
     parse_answers(&buf).map_err(|e| format!("parse dns response from {resolver}: {e}"))
+}
+
+/// 리졸버에 TXT 질의를 보내 TXT 문자열들을 받는다 (Team Cymru ASN 조회용, --asn).
+pub(crate) async fn query_txt(resolver: IpAddr, host: &str) -> Result<Vec<String>, String> {
+    let buf = query_raw(resolver, host, QTYPE_TXT, None).await?;
+    parse_txt(&buf).map_err(|e| format!("parse TXT from {resolver}: {e}"))
+}
+
+/// 리졸버에 PTR 질의를 보내 첫 호스트명을 받는다 (reverse DNS, --asn).
+pub(crate) async fn query_ptr(resolver: IpAddr, host: &str) -> Result<Option<String>, String> {
+    let buf = query_raw(resolver, host, QTYPE_PTR, None).await?;
+    parse_ptr(&buf).map_err(|e| format!("parse PTR from {resolver}: {e}"))
 }
 
 /// 표를 출력한다 (fanout.rs 톤). color면 실패/분기를 강조.
@@ -583,6 +606,139 @@ fn parse_answers(buf: &[u8]) -> Result<Vec<IpAddr>, String> {
     }
 
     Ok(ips)
+}
+
+/// Question 섹션을 건너뛰고 Answer 섹션 시작 위치와 ancount를 돌려준다.
+fn answer_section_start(buf: &[u8]) -> Result<(usize, u16), String> {
+    if buf.len() < 12 {
+        return Err(format!("response too short: {} bytes", buf.len()));
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_name(buf, pos)?;
+        pos = pos
+            .checked_add(4)
+            .ok_or_else(|| "question section overflow".to_string())?;
+        if pos > buf.len() {
+            return Err("truncated question section".to_string());
+        }
+    }
+    Ok((pos, ancount))
+}
+
+/// 응답의 모든 TXT RR 문자열(세그먼트 이어붙임)을 반환한다.
+fn parse_txt(buf: &[u8]) -> Result<Vec<String>, String> {
+    let (mut pos, ancount) = answer_section_start(buf)?;
+    let mut out = Vec::new();
+    for _ in 0..ancount {
+        pos = skip_name(buf, pos)?;
+        let fixed_end = pos
+            .checked_add(10)
+            .ok_or_else(|| "rr header overflow".to_string())?;
+        if fixed_end > buf.len() {
+            return Err("truncated rr header".to_string());
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        let rdata_start = fixed_end;
+        let rdata_end = rdata_start
+            .checked_add(rdlength)
+            .ok_or_else(|| "rdata overflow".to_string())?;
+        if rdata_end > buf.len() {
+            return Err("truncated rdata".to_string());
+        }
+        if rtype == QTYPE_TXT {
+            // TXT RDATA = <len><bytes> 세그먼트들의 연속.
+            let mut p = rdata_start;
+            let mut s = String::new();
+            while p < rdata_end {
+                let seg_len = buf[p] as usize;
+                p += 1;
+                let seg_end = (p + seg_len).min(rdata_end);
+                s.push_str(&String::from_utf8_lossy(&buf[p..seg_end]));
+                p = seg_end;
+            }
+            out.push(s);
+        }
+        pos = rdata_end;
+    }
+    Ok(out)
+}
+
+/// 응답에서 첫 PTR RR의 도메인 네임을 반환한다 (없으면 None).
+fn parse_ptr(buf: &[u8]) -> Result<Option<String>, String> {
+    let (mut pos, ancount) = answer_section_start(buf)?;
+    for _ in 0..ancount {
+        pos = skip_name(buf, pos)?;
+        let fixed_end = pos
+            .checked_add(10)
+            .ok_or_else(|| "rr header overflow".to_string())?;
+        if fixed_end > buf.len() {
+            return Err("truncated rr header".to_string());
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        let rdata_start = fixed_end;
+        let rdata_end = rdata_start
+            .checked_add(rdlength)
+            .ok_or_else(|| "rdata overflow".to_string())?;
+        if rdata_end > buf.len() {
+            return Err("truncated rdata".to_string());
+        }
+        if rtype == QTYPE_PTR {
+            let (name, _) = parse_name(buf, rdata_start)?;
+            return Ok(Some(name));
+        }
+        pos = rdata_end;
+    }
+    Ok(None)
+}
+
+/// pos에서 시작하는 DNS NAME을 압축 포인터를 따라가며 문자열로 파싱한다.
+/// 반환은 (이름, 압축 포인터를 처음 만나기 전까지 소비한 다음 위치).
+fn parse_name(buf: &[u8], start: usize) -> Result<(String, usize), String> {
+    let mut labels = Vec::new();
+    let mut pos = start;
+    let mut jumped = false;
+    let mut next = start;
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 128 {
+            return Err("name compression loop".to_string());
+        }
+        let len = *buf.get(pos).ok_or_else(|| "name length oob".to_string())?;
+        match len & 0xC0 {
+            0x00 => {
+                if len == 0 {
+                    if !jumped {
+                        next = pos + 1;
+                    }
+                    break;
+                }
+                let s = pos + 1;
+                let e = s + len as usize;
+                if e > buf.len() {
+                    return Err("label oob".to_string());
+                }
+                labels.push(String::from_utf8_lossy(&buf[s..e]).into_owned());
+                pos = e;
+            }
+            0xC0 => {
+                let b2 = *buf.get(pos + 1).ok_or_else(|| "pointer oob".to_string())?;
+                let ptr = (((len & 0x3F) as usize) << 8) | b2 as usize;
+                if !jumped {
+                    next = pos + 2;
+                    jumped = true;
+                }
+                pos = ptr;
+            }
+            _ => return Err("invalid label type".to_string()),
+        }
+    }
+    Ok((labels.join("."), next))
 }
 
 /// pos에서 시작하는 DNS NAME(라벨 시퀀스 또는 압축 포인터)을 건너뛰고 그 다음 위치를 반환한다.
