@@ -87,7 +87,11 @@ pub struct ServeArgs {
     pub respond_body: Option<String>,
 
     /// Respond with the contents of this file instead of echoing the request
-    #[arg(long = "respond-file", value_name = "PATH", conflicts_with = "respond_body")]
+    #[arg(
+        long = "respond-file",
+        value_name = "PATH",
+        conflicts_with = "respond_body"
+    )]
     pub respond_file: Option<String>,
 
     /// Content-Type for the response body
@@ -224,9 +228,11 @@ async fn run(args: ServeArgs) -> anyhow::Result<ExitCode> {
     // 고정 응답 바디를 미리 로드(요청마다 파일을 읽지 않는다).
     let respond_body = match (&args.respond_body, &args.respond_file) {
         (Some(s), _) => Some(Bytes::from(s.clone().into_bytes())),
-        (None, Some(path)) => Some(Bytes::from(
-            fs::read(path).with_context(|| format!("failed to read --respond-file: {path}"))?,
-        )),
+        (None, Some(path)) => {
+            Some(Bytes::from(fs::read(path).with_context(|| {
+                format!("failed to read --respond-file: {path}")
+            })?))
+        }
         (None, None) => None,
     };
 
@@ -553,16 +559,16 @@ fn load_pem(
     cert_path: &str,
     key_path: &str,
 ) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_file =
-        fs::File::open(cert_path).with_context(|| format!("failed to open --tls-cert: {cert_path}"))?;
+    let cert_file = fs::File::open(cert_path)
+        .with_context(|| format!("failed to open --tls-cert: {cert_path}"))?;
     let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse --tls-cert: {cert_path}"))?;
     if certs.is_empty() {
         bail!("no certificates found in --tls-cert: {cert_path}");
     }
-    let key_file =
-        fs::File::open(key_path).with_context(|| format!("failed to open --tls-key: {key_path}"))?;
+    let key_file = fs::File::open(key_path)
+        .with_context(|| format!("failed to open --tls-key: {key_path}"))?;
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
         .with_context(|| format!("failed to parse --tls-key: {key_path}"))?
         .with_context(|| format!("no private key found in --tls-key: {key_path}"))?;
@@ -583,8 +589,11 @@ fn print_dump(captured: &CapturedRequest, data: &[u8]) {
     let sep = "─".repeat(63);
     println!(
         "{}",
-        format!("┌─ #{} {}  from {}", captured.seq, captured.time, captured.peer)
-            .dimmed()
+        format!(
+            "┌─ #{} {}  from {}",
+            captured.seq, captured.time, captured.peer
+        )
+        .dimmed()
     );
     println!(
         "{} {}  {}",
