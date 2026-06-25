@@ -39,6 +39,9 @@ Total                     117.6 ms
 - **Security & ops diagnostics** — `--tls-grade` (A–F TLS connection scorecard), `--cache-audit`
   (CDN HIT/MISS + cache anti-patterns), `--on-breach` (ping-mode webhook alerting),
   `--blackbox-config` (blackbox_exporter drop-in: modules YAML + `/probe` endpoint)
+- **Request inspection** — `serve` runs a local echo server that dumps every incoming request
+  (method/headers/body) and echoes it back as JSON (httpbin/RequestBin-style); mock responses
+  (`--status`/`--delay`/`--respond-*`), NDJSON (`--json`), and a `GET /__requests` capture log
 - **Two commands** — `httprove` (full)/`hpr` (short), self-update via `httprove update`
 
 ## What it measures
@@ -94,7 +97,9 @@ make release          # release build → ./target/release/{httprove,hpr}
 make build            # debug build → ./target/debug/{httprove,hpr}
 make ci               # format check + clippy + tests + release build
 make smoke            # smoke test against a live service
-make install          # install httprove + hpr to ~/.cargo/bin
+make install          # overwrite the httprove/hpr on your PATH with this build
+                      #   (auto-detects the active location; override: make install PREFIX=/usr/local/bin)
+make install-cargo    # install to ~/.cargo/bin via cargo install
 make help             # list all targets
 ```
 
@@ -231,6 +236,28 @@ httprove -c 10 --json https://api.example.com | jq 'select(.type=="probe") | .to
 
 - One line per probe: `{"type":"probe","seq":0,"hops":[{"timings":{...},"cert_chain":[...],...}],...}`
 - A summary line at the end: `{"type":"summary","phases":{"ttfb":{"p95":...},...},"status_counts":{"200":10},...}`
+
+### Inspect incoming requests (`serve`)
+
+The other direction: instead of sending requests, run a server that shows what a client
+(your app, frontend, or a webhook sender) actually transmits — a local httpbin/RequestBin.
+
+```bash
+httprove serve :8080                       # bind 0.0.0.0:8080; dump each request + echo it back as JSON
+httprove serve                             # default 127.0.0.1:8080 (local only)
+httprove serve :8080 --json                # one NDJSON line per request (pipe to a file / jq)
+httprove serve :8080 --status 503 --delay 2s   # mock a slow, failing endpoint (test client retry/timeout)
+httprove serve :8080 --respond-body '{"ok":true}' --respond-type application/json   # fixed mock response
+httprove serve :8443 --tls-cert cert.pem --tls-key key.pem   # HTTPS (provide a cert)
+```
+
+- Each request is printed to the console (method, target, headers, pretty body) and, by default,
+  echoed back to the client as a JSON object (`method`/`target`/`query`/`headers`/`body`).
+- `GET /__requests` returns the recent requests as JSON (`--keep N`, default 100);
+  `GET /__requests/<seq>` returns one. `/__`-prefixed paths are not captured/echoed.
+- `--no-echo` replies with a short `ok` instead of echoing; `--respond-header "K: V"` adds headers.
+- HTTPS needs a certificate (`--tls-cert`/`--tls-key`). Generate a self-signed one with:
+  `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout key.pem -out cert.pem -subj '/CN=localhost'`
 
 ## Deep diagnosis (from numbers to conclusions)
 

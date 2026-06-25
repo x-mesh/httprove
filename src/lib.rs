@@ -1,6 +1,7 @@
 //! httprove — HTTP(S) 서비스 점검 도구.
 //!
 //! 모드 결정 (위에서부터 우선):
+//! - `serve [ADDR]`       → 들어오는 요청 인스펙터/에코 서버 (서브커맨드)
 //! - `--cert-check`       → 인증서 일괄 점검 테이블
 //! - `--listen ADDR`      → exporter 모드 (무한 프로브 + /metrics 서버)
 //! - `--tui`              → TUI 대시보드 (-c 없으면 무한)
@@ -30,6 +31,7 @@ mod output;
 mod probe;
 mod record;
 mod runner;
+mod serve;
 mod stats;
 mod tls_grade;
 mod trace;
@@ -61,6 +63,14 @@ pub fn cli_main() -> ExitCode {
         let mut sub = vec![format!("{} update", program_name(&argv))];
         sub.extend(argv.iter().skip(2).cloned());
         return update::main(&sub);
+    }
+
+    // `httprove serve [ADDR] ...` → 들어오는 요청 인스펙터/에코 서버.
+    // update와 동일하게 합성 argv("{prog} serve" + 나머지)로 자체 clap 파서에 넘긴다.
+    if argv.get(1).map(String::as_str) == Some("serve") {
+        let mut sub = vec![format!("{} serve", program_name(&argv))];
+        sub.extend(argv.iter().skip(2).cloned());
+        return serve::main(&sub);
     }
 
     // 조사용 서브커맨드 — 프로브 인자 파서를 거치지 않는 별도 진입점.

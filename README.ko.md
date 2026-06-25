@@ -35,6 +35,9 @@ Total                     117.6 ms
 - **연동** — JSON/NDJSON, Prometheus(`--prom`/`--listen`), OTLP(`--otlp`), HTML 리포트(`--report`)
 - **캡처** — `--trap`(첫 실패 동결), `--record`/`replay`(인시던트 기록·재생)
 - **운영** — keep-alive 모드, `--resolve`, 인증서 일괄 점검(`--cert-check`), 베이스라인 비교
+- **요청 인스펙터** — `serve`로 들어오는 HTTP 요청을 콘솔에 dump(method/헤더/바디)하고 JSON으로
+  에코백하는 로컬 echo 서버(httpbin/RequestBin 류). mock 응답(`--status`/`--delay`/`--respond-*`),
+  NDJSON(`--json`), `GET /__requests` 보관 조회
 - **두 명령** — `httprove`(정식)/`hpr`(단축), `httprove update`로 자가 업데이트
 
 ## 무엇을 측정하나
@@ -90,9 +93,13 @@ make release          # 릴리스 빌드 → ./target/release/{httprove,hpr}
 make build            # 디버깅 빌드 → ./target/debug/{httprove,hpr}
 make ci               # 포맷 검사 + clippy + 테스트 + 릴리스 빌드
 make smoke            # 실서비스 대상 스모크 테스트
-make install          # ~/.cargo/bin에 httprove + hpr 설치
+make install          # PATH에 잡히는 httprove/hpr를 이 빌드로 덮어쓴다
+                      #   (현재 설치 위치 자동 감지; 변경: make install PREFIX=/usr/local/bin)
+make install-cargo    # cargo install로 ~/.cargo/bin에 설치
 make help             # 전체 타깃 목록
 ```
+
+설치 후 `hpr serve :8080`이 바로 동작한다. brew 본을 덮은 경우 `brew upgrade/reinstall`로 되돌아간다.
 
 cargo를 직접 써도 된다: `cargo build --release`
 
@@ -225,6 +232,28 @@ httprove -c 10 --json https://api.example.com | jq 'select(.type=="probe") | .to
 - 프로브 1건당 한 줄: `{"type":"probe","seq":0,"hops":[{"timings":{...},"cert_chain":[...],...}],...}`
 - 마지막에 요약 한 줄: `{"type":"summary","phases":{"ttfb":{"p95":...},...},"status_counts":{"200":10},...}`
 
+### 들어오는 요청 확인 (`serve`)
+
+요청을 *보내는* 게 아니라 *받는* 쪽. 클라이언트(내 앱·프론트·웹훅 발신자)가 실제로 무엇을
+보내는지 보여주는 로컬 httpbin/RequestBin 서버다.
+
+```bash
+httprove serve :8080                       # 0.0.0.0:8080 바인드; 요청마다 dump + JSON 에코백
+httprove serve                             # 기본 127.0.0.1:8080 (로컬 전용)
+httprove serve :8080 --json                # 요청당 NDJSON 한 줄 (파일/jq로 파이프)
+httprove serve :8080 --status 503 --delay 2s   # 느리고 실패하는 엔드포인트 mock (재시도/타임아웃 시험)
+httprove serve :8080 --respond-body '{"ok":true}' --respond-type application/json   # 고정 mock 응답
+httprove serve :8443 --tls-cert cert.pem --tls-key key.pem   # HTTPS (인증서 제공)
+```
+
+- 요청을 콘솔에 출력(method/target/헤더/바디, JSON은 pretty·바이너리는 hexdump)하고, 기본적으로
+  요청을 JSON 객체(`method`/`target`/`query`/`headers`/`body`)로 에코백한다.
+- `GET /__requests`는 최근 요청을 JSON 배열로(`--keep N`, 기본 100), `GET /__requests/<seq>`는 단건을
+  돌려준다. `/__` 경로는 dump·에코 대상에서 제외된다.
+- `--no-echo`는 짧은 `ok`만 응답, `--respond-header "K: V"`로 응답 헤더 추가.
+- HTTPS는 인증서가 필요하다(`--tls-cert`/`--tls-key`). 자체서명은 다음으로 생성:
+  `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout key.pem -out cert.pem -subj '/CN=localhost'`
+
 ## 심층 진단 (숫자를 결론으로)
 
 숫자를 보여주는 데서 그치지 않고 "어디가·왜 문제인지"를 판정한다.
@@ -314,6 +343,7 @@ src/
 ├── record.rs      # --record/replay, --trap (첫 실패 동결)
 ├── otlp.rs        # OTLP/HTTP span export, Server-Timing 파싱, traceparent
 ├── exporter.rs    # --listen Prometheus exporter
+├── serve.rs       # serve 서브커맨드 — 들어오는 요청 인스펙터/에코 서버 (hyper 서버)
 ├── stats.rs       # Welford + 링버퍼 백분위
 ├── runner.rs      # 프로브 반복 루프 (멀티 타깃/간격/일시정지/취소)
 ├── update/        # httprove update — 설치방식 감지 + 자가 교체

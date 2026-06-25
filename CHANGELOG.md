@@ -6,10 +6,24 @@
 
 ### Added
 
+- **요청 인스펙터/에코 서버** (`serve`) — 보내는 쪽이 아니라 *받는* 쪽. 들어오는 모든 HTTP 요청을
+  콘솔에 dump(method/target/헤더/바디, JSON 바디는 pretty·바이너리는 hexdump)하고 기본적으로 그
+  요청을 JSON으로 에코백한다(httpbin/RequestBin 류). 클라이언트·프론트·웹훅 발신자가 *실제로 무엇을
+  보내는지* 확인하는 API 디버깅용. mock 응답(`--status`/`--delay`/`--respond-body`·`--respond-file`/
+  `--respond-type`/`--respond-header`/`--no-echo`), `--json` NDJSON 로그, `--max-body` 상한,
+  `--keep`로 인메모리 보관 후 `GET /__requests`(배열)·`/__requests/<seq>`(단건) 조회, HTTPS
+  (`--tls-cert`/`--tls-key`). hyper 서버(http1+http2 auto) + 기존 exporter accept 루프 패턴 재사용.
+  주소는 `:8080`/`8080`(→0.0.0.0)·`127.0.0.1:8080`, 무인자 기본 `127.0.0.1:8080`.
 - **IP 인텔리전스** (`--asn`) — 연결 IP의 ASN·조직·등록국가(Team Cymru DNS)와 reverse DNS(PTR)를
   조회하고 인프라를 CDN/cloud/origin으로 분류해 단발 출력에 한 줄로 표시한다. 자체 DNS 클라이언트
   (dns.rs에 TXT/PTR 파서 추가)를 재사용하므로 의존성·오프라인 GeoIP DB가 없다. 예: naver=origin,
   cloudflare=CDN, google=cloud/LB.
+
+### Changed
+
+- **`make install`이 PATH의 활성 바이너리를 덮어쓴다** — `dirname $(command -v httprove)`로 실제
+  설치 위치(brew/cargo 무관)를 감지해 `httprove`/`hpr`를 새 릴리스 빌드로 교체한다(`PREFIX=`로 변경,
+  권한 없으면 sudo 폴백). 기존 `cargo install --path .` 동작은 `make install-cargo`로 보존.
 
 ## [0.3.0] - 2026-06-20
 
