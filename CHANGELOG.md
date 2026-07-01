@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-02
+
+### Added
+
+- **dns:** add --dns custom resolver and curl-style --resolve
+
 ## [0.4.0] - 2026-06-25
 
 ### Added
