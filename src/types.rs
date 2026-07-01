@@ -36,6 +36,12 @@ pub struct ProbeConfig {
     pub timeout: Duration,
     /// DNS를 건너뛰고 이 IP로 직접 연결 (SNI/Host는 URL 호스트 유지).
     pub resolve: Option<IpAddr>,
+    /// --dns: 시스템 리졸버(getaddrinfo) 대신 이 DNS 서버들로 호스트를 해석한다
+    /// (일반 프로브 경로). 비어 있으면 시스템 리졸버 사용. resolve override나 IP
+    /// 리터럴 호스트면 무시된다. 순서대로 질의하며 첫 성공 응답을 쓴다 (failover).
+    pub dns_servers: Vec<std::net::SocketAddr>,
+    /// --dns 질의에 붙일 EDNS0 client-subnet CIDR (--ecs). 커스텀 리졸버 경로에만 적용.
+    pub ecs: Option<String>,
     pub ip_family: IpFamily,
     /// true면 TLS 인증서 검증을 생략 (체인 정보는 여전히 수집).
     pub insecure: bool,

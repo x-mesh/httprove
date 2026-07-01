@@ -73,9 +73,19 @@ pub struct Args {
     #[arg(short = '6', long)]
     pub ipv6: bool,
 
-    /// Skip DNS and connect to this IP (Host/SNI still taken from URL)
-    #[arg(long, value_name = "IP")]
-    pub resolve: Option<IpAddr>,
+    /// Pin resolution instead of using DNS. Either a bare IP (applies to every
+    /// target) or curl-style HOST:PORT:ADDR (per host, repeatable) — an in-tool
+    /// /etc/hosts. Host/SNI stay from the URL. Takes precedence over --dns.
+    #[arg(long, value_name = "IP|HOST:PORT:ADDR")]
+    pub resolve: Vec<String>,
+
+    /// Resolve targets through these DNS servers instead of the system resolver
+    /// (comma-separated IP or IP:PORT, tried in order). Combine with --ecs for
+    /// EDNS client-subnet. Works with normal/keepalive/json/prom/tui/exporter modes.
+    #[arg(long, value_name = "IPS", conflicts_with_all = [
+        "via", "fanout", "all_families", "cert_check", "blackbox_config",
+    ])]
+    pub dns: Option<String>,
 
     /// Skip TLS certificate verification (chain is still reported)
     #[arg(short = 'k', long)]
@@ -243,7 +253,7 @@ pub struct Args {
     ])]
     pub via: Option<String>,
 
-    /// EDNS client-subnet for --via (e.g. "203.0.113.0/24")
+    /// EDNS client-subnet for --dns/--via (e.g. "203.0.113.0/24")
     #[arg(long, value_name = "CIDR")]
     pub ecs: Option<String>,
 
@@ -303,6 +313,32 @@ pub struct Args {
     pub apdex_threshold: Option<f64>,
 }
 
+/// `--resolve` 항목들을 파싱한 정적 오버라이드 집합 (DNS를 건너뛰고 고정 IP로 연결).
+#[derive(Debug, Default)]
+pub struct ResolveOverrides {
+    /// bare IP 형태 — 모든 타깃에 적용되는 전역 오버라이드.
+    global: Option<IpAddr>,
+    /// curl식 host:port:addr — 특정 (host 소문자, port)를 이 IP로 고정.
+    per_host: Vec<((String, u16), IpAddr)>,
+}
+
+impl ResolveOverrides {
+    /// 주어진 host/port에 적용할 오버라이드 IP를 찾는다 (per-host 우선, 없으면 전역).
+    pub fn lookup(&self, host: Option<&str>, port: u16) -> Option<IpAddr> {
+        if let Some(h) = host {
+            let key = h.to_ascii_lowercase();
+            if let Some((_, ip)) = self
+                .per_host
+                .iter()
+                .find(|((hh, pp), _)| *hh == key && *pp == port)
+            {
+                return Some(*ip);
+            }
+        }
+        self.global
+    }
+}
+
 impl Args {
     /// 모든 타깃 URL을 정규화해 ProbeConfig 목록을 만든다 (--cert-check 외 모드).
     pub fn to_probe_configs(&self) -> anyhow::Result<Vec<ProbeConfig>> {
@@ -342,6 +378,18 @@ impl Args {
             IpFamily::Auto
         };
 
+        // --dns 서버 목록과 --resolve 오버라이드를 미리 파싱한다 (형식 오류는 하드 에러).
+        let dns_servers = self.parse_dns_servers()?;
+        let resolve_overrides = self.parse_resolve_overrides()?;
+        // --ecs는 커스텀 리졸버(--dns/--via) 경로에서만 적용된다. 그 없이 주면 조용히
+        // 무시되므로(silent no-op) 하드 에러로 거부하고, 있을 때만 CIDR 형식을 미리 검증한다.
+        if let Some(cidr) = &self.ecs {
+            if self.dns.is_none() && self.via.is_none() {
+                bail!("--ecs only applies to --dns or --via; pass one of them (or drop --ecs)");
+            }
+            crate::dns::validate_ecs(cidr)?;
+        }
+
         let mut cfgs = Vec::with_capacity(self.targets.len());
         // 결과 라우팅/통계/exporter가 정규화된 URL 문자열을 키로 쓰므로, 정규화 후
         // 충돌하는 타깃(예: "example.com"과 "EXAMPLE.com:443/")은 한 슬롯으로
@@ -367,13 +415,19 @@ impl Args {
                 bail!("duplicate target after normalization: {raw} -> {url}");
             }
 
+            // 이 타깃에 적용할 정적 오버라이드: per-host(host:port) 우선, 없으면 전역 bare-IP.
+            let resolve =
+                resolve_overrides.lookup(url.host_str(), url.port_or_known_default().unwrap_or(0));
+
             cfgs.push(ProbeConfig {
                 url,
                 method: self.method.to_uppercase(),
                 headers: headers.clone(),
                 body: self.data.clone(),
                 timeout: Duration::from_secs_f64(self.timeout),
-                resolve: self.resolve,
+                resolve,
+                dns_servers: dns_servers.clone(),
+                ecs: self.ecs.clone(),
                 ip_family,
                 // --check-chain은 검증 실패(UnknownIssuer 등)로 핸드셰이크가 끊겨도 체인을
                 // 수집해 분석해야 하므로 무검증 핸드셰이크를 강제한다 (체인 진단 목적).
@@ -472,6 +526,90 @@ impl Args {
         Ok(resolvers)
     }
 
+    /// `--dns` CSV(IP 또는 IP:PORT)를 SocketAddr 목록으로 파싱한다 (일반 프로브 경로용).
+    /// bare IP는 포트 53으로 보정한다. --dns가 없으면 빈 Vec.
+    pub fn parse_dns_servers(&self) -> anyhow::Result<Vec<SocketAddr>> {
+        let mut servers = Vec::new();
+        let Some(spec) = &self.dns else {
+            return Ok(servers);
+        };
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            // IP:PORT를 먼저 시도하고, 실패하면 bare IP(→ 53)로 본다. IPv6에 포트를
+            // 붙이려면 [::1]:5353 형식을 써야 한다 (bare 2001:db8::1은 포트 53).
+            let addr = if let Ok(sa) = part.parse::<SocketAddr>() {
+                sa
+            } else if let Ok(ip) = part.parse::<IpAddr>() {
+                SocketAddr::new(ip, 53)
+            } else {
+                bail!("invalid --dns server (expected IP or IP:PORT): {part}");
+            };
+            if !servers.contains(&addr) {
+                servers.push(addr);
+            }
+        }
+        if servers.is_empty() {
+            bail!("--dns has no valid servers: {spec}");
+        }
+        Ok(servers)
+    }
+
+    /// `--resolve` 항목들을 전역 IP / per-host 매핑으로 파싱한다.
+    /// - bare IP("203.0.113.5"): 전역 오버라이드 (모든 타깃).
+    /// - curl식 "host:port:addr": per-host 오버라이드. addr가 IPv6일 수 있으므로
+    ///   앞에서 두 번만 분리한다(splitn(3)). 전역 IP를 둘 이상 주거나 같은
+    ///   host:port를 중복 지정하면 하드 에러.
+    pub fn parse_resolve_overrides(&self) -> anyhow::Result<ResolveOverrides> {
+        let mut out = ResolveOverrides::default();
+        for raw in &self.resolve {
+            let s = raw.trim();
+            // --resolve는 반복 플래그(항목당 값 하나)이므로 빈 값은 실수다 — 조용히
+            // 넘기면 의도한 고정이 사라져 엉뚱한 백엔드를 친다. 하드 에러로 거부한다.
+            if s.is_empty() {
+                bail!("--resolve given an empty value");
+            }
+            // 1) bare IP → 전역. (IPv6 리터럴도 여기서 잡으므로 host:port:addr보다 먼저.)
+            if let Ok(ip) = s.parse::<IpAddr>() {
+                if out.global.replace(ip).is_some() {
+                    bail!("--resolve given more than one global IP");
+                }
+                continue;
+            }
+            // 2) curl식 host:port:addr.
+            let mut it = s.splitn(3, ':');
+            let host = it.next().unwrap_or("").trim();
+            let (Some(port), Some(addr)) = (it.next(), it.next()) else {
+                bail!("invalid --resolve (expected IP or HOST:PORT:ADDR): {raw}");
+            };
+            if host.is_empty() {
+                bail!("--resolve has empty host: {raw}");
+            }
+            let port: u16 = port
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid --resolve port in {raw}"))?;
+            // addr는 curl처럼 대괄호 IPv6([2001:db8::1])도 허용한다 (IpAddr::from_str은
+            // 대괄호를 안 받으므로 감싼 [] 한 쌍을 벗겨낸다).
+            let addr_str = addr.trim();
+            let addr_str = addr_str
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(addr_str);
+            let addr: IpAddr = addr_str
+                .parse()
+                .with_context(|| format!("invalid --resolve address in {raw}"))?;
+            let key = (host.to_ascii_lowercase(), port);
+            if out.per_host.iter().any(|(k, _)| *k == key) {
+                bail!("duplicate --resolve entry for {host}:{port}");
+            }
+            out.per_host.push((key, addr));
+        }
+        Ok(out)
+    }
+
     /// `--warn phase=ms` 목록을 WarnThresholds로 변환한다.
     pub fn parse_warn(&self) -> anyhow::Result<WarnThresholds> {
         let mut warn = WarnThresholds::default();
@@ -497,5 +635,259 @@ impl Args {
             *slot = Some(ms);
         }
         Ok(warn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap으로 Args를 파싱한다 (기본 바이너리명 + 인자). 실패는 패닉.
+    fn args(argv: &[&str]) -> Args {
+        let mut v = vec!["httprove"];
+        v.extend_from_slice(argv);
+        Args::try_parse_from(v).expect("parse args")
+    }
+
+    #[test]
+    fn parse_dns_servers_bare_and_port() {
+        let a = args(&["ex.com", "--dns", "1.1.1.1,8.8.8.8:5353"]);
+        let servers = a.parse_dns_servers().expect("dns");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0], "1.1.1.1:53".parse().unwrap());
+        assert_eq!(servers[1], "8.8.8.8:5353".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_dns_servers_ipv6_bracket_and_bare() {
+        let a = args(&["ex.com", "--dns", "2001:db8::1,[2001:db8::2]:5353"]);
+        let servers = a.parse_dns_servers().expect("dns");
+        assert_eq!(servers[0], "[2001:db8::1]:53".parse().unwrap());
+        assert_eq!(servers[1], "[2001:db8::2]:5353".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_dns_servers_dedup_and_none() {
+        let a = args(&["ex.com", "--dns", "1.1.1.1, 1.1.1.1 ,"]);
+        assert_eq!(a.parse_dns_servers().expect("dns").len(), 1);
+        // --dns 미지정이면 빈 Vec.
+        assert!(args(&["ex.com"]).parse_dns_servers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_dns_servers_invalid_errs() {
+        assert!(
+            args(&["ex.com", "--dns", "not-an-ip"])
+                .parse_dns_servers()
+                .is_err()
+        );
+        // 값은 있지만 전부 공백/빈 항목이면 에러.
+        assert!(
+            args(&["ex.com", "--dns", " , "])
+                .parse_dns_servers()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_global_bare_ip() {
+        let ov = args(&["ex.com", "--resolve", "203.0.113.5"])
+            .parse_resolve_overrides()
+            .expect("resolve");
+        assert_eq!(
+            ov.lookup(Some("anything.com"), 443),
+            Some("203.0.113.5".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolve_per_host_curl_form() {
+        let ov = args(&["ex.com", "--resolve", "ex.com:443:203.0.113.5"])
+            .parse_resolve_overrides()
+            .expect("resolve");
+        // 대소문자 무시 매칭.
+        assert_eq!(
+            ov.lookup(Some("EX.com"), 443),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        // 포트가 다르거나 다른 호스트면 매칭 안 됨(전역 없음).
+        assert_eq!(ov.lookup(Some("ex.com"), 8443), None);
+        assert_eq!(ov.lookup(Some("other.com"), 443), None);
+    }
+
+    #[test]
+    fn resolve_per_host_ipv6_addr() {
+        let ov = args(&["ex.com", "--resolve", "ex.com:443:2001:db8::1"])
+            .parse_resolve_overrides()
+            .expect("resolve");
+        assert_eq!(
+            ov.lookup(Some("ex.com"), 443),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolve_per_host_beats_global() {
+        let ov = args(&[
+            "a.com",
+            "b.com",
+            "--resolve",
+            "9.9.9.9",
+            "--resolve",
+            "a.com:443:1.2.3.4",
+        ])
+        .parse_resolve_overrides()
+        .expect("resolve");
+        assert_eq!(
+            ov.lookup(Some("a.com"), 443),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            ov.lookup(Some("b.com"), 443),
+            Some("9.9.9.9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolve_errors() {
+        // 전역 IP 둘 이상.
+        assert!(
+            args(&["ex.com", "--resolve", "1.1.1.1", "--resolve", "2.2.2.2"])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+        // 같은 host:port 중복.
+        assert!(
+            args(&[
+                "ex.com",
+                "--resolve",
+                "ex.com:443:1.1.1.1",
+                "--resolve",
+                "ex.com:443:2.2.2.2"
+            ])
+            .parse_resolve_overrides()
+            .is_err()
+        );
+        // 형식/포트/주소 오류.
+        assert!(
+            args(&["ex.com", "--resolve", "ex.com:443"])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+        assert!(
+            args(&["ex.com", "--resolve", "ex.com:notaport:1.1.1.1"])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+        assert!(
+            args(&["ex.com", "--resolve", "ex.com:443:not-an-ip"])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn to_probe_configs_wires_dns_and_resolve() {
+        let cfgs = args(&[
+            "https://a.com",
+            "https://b.com",
+            "--dns",
+            "1.1.1.1",
+            "--resolve",
+            "a.com:443:10.0.0.1",
+        ])
+        .to_probe_configs()
+        .expect("cfgs");
+        assert_eq!(cfgs.len(), 2);
+        // 두 타깃 모두 커스텀 DNS 서버를 받는다.
+        for c in &cfgs {
+            assert_eq!(c.dns_servers, vec!["1.1.1.1:53".parse().unwrap()]);
+        }
+        // a.com은 per-host 오버라이드로 resolve 고정, b.com은 없음.
+        let a_cfg = cfgs
+            .iter()
+            .find(|c| c.url.host_str() == Some("a.com"))
+            .unwrap();
+        let b_cfg = cfgs
+            .iter()
+            .find(|c| c.url.host_str() == Some("b.com"))
+            .unwrap();
+        assert_eq!(a_cfg.resolve, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(b_cfg.resolve, None);
+    }
+
+    #[test]
+    fn bare_ip_resolve_backward_compat() {
+        // 기존 사용법: --resolve <IP> 하나 → 전역, 모든 타깃에 적용.
+        let cfgs = args(&["https://ex.com", "--resolve", "203.0.113.9"])
+            .to_probe_configs()
+            .expect("cfgs");
+        assert_eq!(cfgs[0].resolve, Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn dns_conflicts_with_investigation_modes() {
+        // --dns는 자체 해석/조사 모드와 충돌한다 (silent no-op 방지).
+        for other in [
+            vec!["--via", "8.8.8.8"],
+            vec!["--fanout"],
+            vec!["--all-families"],
+            vec!["--cert-check"],
+        ] {
+            let mut v = vec!["httprove", "ex.com", "--dns", "1.1.1.1"];
+            v.extend_from_slice(&other);
+            assert!(
+                Args::try_parse_from(v).is_err(),
+                "expected conflict with {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_empty_value_errs() {
+        // 빈/공백 --resolve 값은 조용히 무시하지 않고 하드 에러 (하위호환: 옛 Option<IpAddr>도 거부).
+        assert!(
+            args(&["ex.com", "--resolve", ""])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+        assert!(
+            args(&["ex.com", "--resolve", "   "])
+                .parse_resolve_overrides()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_bracketed_ipv6_addr() {
+        // curl식 대괄호 IPv6 addr도 허용한다.
+        let ov = args(&["ex.com", "--resolve", "ex.com:443:[2001:db8::1]"])
+            .parse_resolve_overrides()
+            .expect("resolve");
+        assert_eq!(
+            ov.lookup(Some("ex.com"), 443),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ecs_requires_dns_or_via() {
+        // --ecs 단독은 무의미하므로 하드 에러 (--dns/--via 없이).
+        assert!(
+            args(&["https://ex.com", "--ecs", "203.0.113.0/24"])
+                .to_probe_configs()
+                .is_err()
+        );
+        // --dns와 함께면 통과하고 모든 cfg에 실린다.
+        let cfgs = args(&[
+            "https://ex.com",
+            "--dns",
+            "1.1.1.1",
+            "--ecs",
+            "203.0.113.0/24",
+        ])
+        .to_probe_configs()
+        .expect("cfgs");
+        assert_eq!(cfgs[0].ecs.as_deref(), Some("203.0.113.0/24"));
     }
 }

@@ -192,6 +192,8 @@ fn minimal_probe_config(raw: &str) -> anyhow::Result<types::ProbeConfig> {
         body: None,
         timeout: Duration::from_secs(10),
         resolve: None,
+        dns_servers: Vec::new(),
+        ecs: None,
         ip_family: types::IpFamily::Auto,
         insecure: false,
         http_version: types::HttpVersionPref::Auto,

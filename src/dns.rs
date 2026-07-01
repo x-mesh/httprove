@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use colored::Colorize;
 use tokio::net::UdpSocket;
+use tokio::time::Instant as TokioInstant;
 
 use crate::types::{IpFamily, ProbeConfig};
 
@@ -67,6 +68,13 @@ const EDNS_OPT_CLIENT_SUBNET: u16 = 8;
 const EDNS_UDP_PAYLOAD: u16 = 4096;
 /// DNS 질의 1회의 UDP 송수신 타임아웃.
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
+/// --dns 경로에서 한 서버에 할당하는 질의 예산 상한. 남은 전체 예산을 남은 서버 수로
+/// 나눈 값과 이 상한 중 작은 쪽을 쓴다 (정상 서버는 ms 안에 응답하므로 상한은 죽은
+/// 서버가 예산을 다 먹지 않게 하는 안전판이다).
+const DNS_QUERY_CAP: Duration = Duration::from_secs(3);
+/// --dns Auto에서 먼저 응답한 패밀리 확보 후, 다른 패밀리를 추가로 기다리는 짧은 유예.
+/// 한 패밀리가 조용히 드롭돼도 전체 해석이 그만큼만 지연되게 한다 (happy-eyeballs 유사).
+const DNS_SECOND_FAMILY_GRACE: Duration = Duration::from_millis(150);
 /// 응답 수신 버퍼 (표준 UDP DNS는 512B, EDNS면 더 클 수 있어 넉넉히 잡는다).
 const RECV_BUF: usize = 4096;
 
@@ -261,6 +269,203 @@ async fn query_resolver(
 ) -> Result<Vec<IpAddr>, String> {
     let buf = query_raw(resolver, host, qtype, ecs).await?;
     parse_answers(&buf).map_err(|e| format!("parse dns response from {resolver}: {e}"))
+}
+
+/// `--ecs` CIDR 문자열의 형식을 CLI 단에서 미리 검증한다 (실패 시 하드 에러).
+/// parse_ecs를 재사용하되 내부 타입을 노출하지 않기 위해 결과는 버린다.
+pub(crate) fn validate_ecs(cidr: &str) -> anyhow::Result<()> {
+    parse_ecs(cidr).map(|_| ())
+}
+
+/// `--dns`용: 커스텀 DNS 서버들로 호스트를 해석해 IP 목록을 반환한다 (일반 프로브 경로).
+///
+/// `run_via_resolvers`(비교 표 전용)와 달리, 이 함수는 일반 프로브 흐름에서 시스템
+/// 리졸버를 대체하는 순수 해석기다. 서버를 순서대로 시도해 첫 성공 응답을 쓴다(failover).
+/// `ecs`가 있으면 EDNS0 client-subnet 옵션을 붙인다.
+///
+/// **예산 배분(failover 보장):** 남은 시간(`deadline - now`)을 남은 서버 수로 나눠 각
+/// 서버에 할당하므로, 앞선 죽은 서버가 뒤의 정상 서버 기회를 굶기지 않는다.
+///
+/// **Auto 패밀리:** A/AAAA를 동시에 질의하고, 먼저 온 패밀리 확보 후 다른 쪽을 짧은
+/// 유예(DNS_SECOND_FAMILY_GRACE)만 더 기다린다 — 한 패밀리가 조용히 드롭돼도 전체가
+/// 그만큼만 지연된다. 반환 순서는 IPv4 우선(가장 넓은 호스트에서 안전한 연결 기본값;
+/// 특정 패밀리 강제는 -4/-6).
+///
+/// 어떤 서버에서도 주소를 얻지 못하면 마지막 실패 사유를 담은 Err를 반환한다.
+pub async fn resolve_via_servers(
+    servers: &[SocketAddr],
+    host: &str,
+    family: IpFamily,
+    ecs: Option<&str>,
+    deadline: TokioInstant,
+) -> Result<Vec<IpAddr>, String> {
+    if servers.is_empty() {
+        return Err("no DNS servers configured".to_string());
+    }
+    let ecs_subnet = match ecs {
+        Some(cidr) => Some(parse_ecs(cidr).map_err(|e| e.to_string())?),
+        None => None,
+    };
+
+    let mut last_err: Option<String> = None;
+    for (i, &server) in servers.iter().enumerate() {
+        let now = TokioInstant::now();
+        if now >= deadline {
+            last_err.get_or_insert_with(|| "DNS resolution deadline exceeded".to_string());
+            break;
+        }
+        // 남은 예산을 남은 서버 수로 나눠 이 서버의 질의 예산을 정한다 (상한은 DNS_QUERY_CAP).
+        let slots = (servers.len() - i) as u32;
+        let budget = (deadline.duration_since(now) / slots).min(DNS_QUERY_CAP);
+
+        match query_server_family(server, host, family, ecs_subnet.as_ref(), budget).await {
+            Ok(ips) if !ips.is_empty() => return Ok(ips),
+            Ok(_) => last_err = Some(format!("{server}: no address records")),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "all DNS servers failed".to_string()))
+}
+
+/// 한 서버에서 `family`에 맞는 주소를 조회한다. Auto는 A/AAAA를 동시에 질의해
+/// 직렬화 지연을 없애고(한 패밀리 드롭에도 유예만큼만 대기), IPv4 우선으로 정렬한다.
+async fn query_server_family(
+    server: SocketAddr,
+    host: &str,
+    family: IpFamily,
+    ecs: Option<&EcsSubnet>,
+    budget: Duration,
+) -> Result<Vec<IpAddr>, String> {
+    match family {
+        IpFamily::V4 => {
+            let mut ips = query_server(server, host, QTYPE_A, ecs, budget).await?;
+            ips.retain(IpAddr::is_ipv4);
+            ips.sort();
+            ips.dedup();
+            Ok(ips)
+        }
+        IpFamily::V6 => {
+            let mut ips = query_server(server, host, QTYPE_AAAA, ecs, budget).await?;
+            ips.retain(IpAddr::is_ipv6);
+            ips.sort();
+            ips.dedup();
+            Ok(ips)
+        }
+        IpFamily::Auto => {
+            // A/AAAA 동시 질의. 먼저 끝난 쪽을 받고, 남은 쪽은 짧은 유예만 더 기다린다.
+            let a_fut = query_server(server, host, QTYPE_A, ecs, budget);
+            let aaaa_fut = query_server(server, host, QTYPE_AAAA, ecs, budget);
+            tokio::pin!(a_fut, aaaa_fut);
+
+            let mut v4: Vec<IpAddr> = Vec::new();
+            let mut v6: Vec<IpAddr> = Vec::new();
+            let mut err: Option<String> = None;
+            let mut a_done = false;
+            let mut aaaa_done = false;
+
+            // 1) 둘 중 먼저 완료되는 것을 기다린다.
+            tokio::select! {
+                r = &mut a_fut => { a_done = true; collect(r, &mut v4, &mut err); }
+                r = &mut aaaa_fut => { aaaa_done = true; collect(r, &mut v6, &mut err); }
+            }
+            // 2) 아직 안 끝난 패밀리는 유예만큼만 더 기다린다 (막힌 패밀리가 전체를 끌지 않게).
+            if !a_done
+                && let Ok(r) = tokio::time::timeout(DNS_SECOND_FAMILY_GRACE, &mut a_fut).await
+            {
+                collect(r, &mut v4, &mut err);
+            }
+            if !aaaa_done
+                && let Ok(r) = tokio::time::timeout(DNS_SECOND_FAMILY_GRACE, &mut aaaa_fut).await
+            {
+                collect(r, &mut v6, &mut err);
+            }
+
+            v4.retain(IpAddr::is_ipv4);
+            v6.retain(IpAddr::is_ipv6);
+            v4.sort();
+            v4.dedup();
+            v6.sort();
+            v6.dedup();
+
+            // IPv4 우선으로 병합.
+            let mut ips = v4;
+            for ip in v6 {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            // 둘 다 실패해 주소가 없으면 실제 실패 사유를 전달한다.
+            if ips.is_empty()
+                && let Some(e) = err
+            {
+                return Err(e);
+            }
+            Ok(ips)
+        }
+    }
+}
+
+/// query_server 결과를 목적지 벡터/에러 슬롯에 반영한다 (Auto 병합 헬퍼).
+fn collect(r: Result<Vec<IpAddr>, String>, dst: &mut Vec<IpAddr>, err: &mut Option<String>) {
+    match r {
+        Ok(ips) => dst.extend(ips),
+        Err(e) => {
+            if err.is_none() {
+                *err = Some(e);
+            }
+        }
+    }
+}
+
+/// 지정한 서버(IP:PORT)에 1개 레코드 타입을 질의하고 응답 IP들을 반환한다.
+/// query_raw와 달리 (1) 리졸버 포트/타임아웃을 호출자가 지정하고 (--dns 커스텀 포트),
+/// (2) 소켓을 서버에 connect해 커널이 다른 소스의 데이터그램을 걸러내며,
+/// (3) 응답의 트랜잭션 ID와 QR 비트를 검증해 스트레이/스푸핑 응답을 건너뛴다.
+async fn query_server(
+    server: SocketAddr,
+    host: &str,
+    qtype: u16,
+    ecs: Option<&EcsSubnet>,
+    timeout: Duration,
+) -> Result<Vec<IpAddr>, String> {
+    let id = rand_id();
+    let query = encode_query(id, host, qtype, ecs)?;
+
+    let bind_addr: SocketAddr = match server.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| format!("udp bind: {e}"))?;
+    // connect로 커널이 server 외 소스의 데이터그램을 폐기하게 한다 (오프패스 스푸핑 완화).
+    socket
+        .connect(server)
+        .await
+        .map_err(|e| format!("udp connect {server}: {e}"))?;
+
+    tokio::time::timeout(timeout, async {
+        socket
+            .send(&query)
+            .await
+            .map_err(|e| format!("udp send to {server}: {e}"))?;
+        let mut buf = vec![0u8; RECV_BUF];
+        // 트랜잭션 ID/QR가 맞는 응답이 올 때까지 (예산 안에서) 스트레이 데이터그램을 건너뛴다.
+        loop {
+            let n = socket
+                .recv(&mut buf)
+                .await
+                .map_err(|e| format!("udp recv from {server}: {e}"))?;
+            // 헤더 최소 길이 + QR=1(응답) + 질의와 같은 트랜잭션 ID인지 확인.
+            if n >= 12 && (buf[2] & 0x80) != 0 && u16::from_be_bytes([buf[0], buf[1]]) == id {
+                return parse_answers(&buf[..n])
+                    .map_err(|e| format!("parse dns response from {server}: {e}"));
+            }
+            // 일치하지 않는 데이터그램은 무시하고 계속 기다린다.
+        }
+    })
+    .await
+    .map_err(|_| format!("dns query to {server} timed out"))?
 }
 
 /// 리졸버에 TXT 질의를 보내 TXT 문자열들을 받는다 (Team Cymru ASN 조회용, --asn).
@@ -974,5 +1179,39 @@ mod tests {
 
         // 경계 밖이면 Err (패닉 금지).
         assert!(skip_name(&[1u8, b'a'], 0).is_err());
+    }
+
+    #[test]
+    fn validate_ecs_accepts_and_rejects() {
+        assert!(validate_ecs("203.0.113.0/24").is_ok());
+        assert!(validate_ecs("2001:db8::/48").is_ok());
+        // 슬래시 없음 / 잘못된 prefix / 잘못된 IP → 에러.
+        assert!(validate_ecs("203.0.113.0").is_err());
+        assert!(validate_ecs("203.0.113.0/40").is_err());
+        assert!(validate_ecs("not-an-ip/24").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_via_servers_empty_is_err() {
+        // 서버가 없으면 네트워크 시도 없이 즉시 Err.
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        let r = resolve_via_servers(&[], "example.com", IpFamily::Auto, None, deadline).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_via_servers_bad_ecs_is_err() {
+        // 잘못된 ECS CIDR은 네트워크 시도 전에 걸러진다.
+        let server: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let deadline = TokioInstant::now() + Duration::from_millis(50);
+        let r = resolve_via_servers(
+            &[server],
+            "example.com",
+            IpFamily::Auto,
+            Some("bad-cidr"),
+            deadline,
+        )
+        .await;
+        assert!(r.is_err());
     }
 }

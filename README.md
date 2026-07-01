@@ -35,7 +35,8 @@ Total                     117.6 ms
 - **Synthetic monitoring** — `--expect-*` assertions (exit code 3), `--warn` threshold highlighting
 - **Integration** — JSON/NDJSON, Prometheus (`--prom`/`--listen`), OTLP (`--otlp`), HTML report (`--report`)
 - **Capture** — `--trap` (freeze on first failure), `--record`/`replay` (record & replay incidents)
-- **Operations** — keep-alive mode, `--resolve`, bulk certificate check (`--cert-check`), baseline comparison
+- **DNS control** — `--dns` (resolve through chosen servers, not the system resolver), `--resolve` (bypass DNS: bare IP or curl-style `host:port:addr`)
+- **Operations** — keep-alive mode, bulk certificate check (`--cert-check`), baseline comparison
 - **Security & ops diagnostics** — `--tls-grade` (A–F TLS connection scorecard), `--cache-audit`
   (CDN HIT/MISS + cache anti-patterns), `--on-breach` (ping-mode webhook alerting),
   `--blackbox-config` (blackbox_exporter drop-in: modules YAML + `/probe` endpoint)
@@ -218,6 +219,8 @@ Keys: `q` quit, `space` pause, `r` reset stats.
 ```bash
 httprove -L https://example.com              # follow redirects (measured per hop)
 httprove --resolve 10.0.0.5 https://api.example.com   # hit a specific backend directly (bypass DNS, keep SNI/Host)
+httprove --resolve api.example.com:443:10.0.0.5 https://api.example.com   # curl-style per-host pin (in-tool /etc/hosts, repeatable)
+httprove --dns 1.1.1.1,8.8.8.8 https://api.example.com   # resolve through specific DNS servers instead of the system resolver
 httprove -4 https://api.example.com          # force IPv4 (-6: IPv6)
 httprove --http1 https://api.example.com     # force HTTP/1.1 (disable h2 negotiation)
 httprove -k https://expired.internal         # skip certificate verification (chain info still collected)
@@ -278,6 +281,7 @@ Exit code is PASS=0 / DOWN=1, ready to use directly in synthetic monitoring.
 httprove --fanout https://api.example.com          # probe every DNS IP individually, catch a bad backend (outlier)
 httprove --all-families https://api.example.com    # IPv4 vs IPv6 phase-by-phase comparison
 httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # compare response IP/POP per resolver (--ecs for client-subnet)
+httprove --dns 1.1.1.1 https://api.example.com     # probe through a chosen resolver (normal flow; combine with -c/--json/--verdict)
 httprove trace https://api.example.com             # system traceroute + TLS-terminating hop annotation
 httprove --asn https://api.example.com             # connected IP's ASN/org/country (Team Cymru) + PTR + infra (CDN/cloud/origin)
 ```
@@ -358,7 +362,7 @@ src/
 ├── verdict.rs     # health verdict PASS/DEGRADED/DOWN (--verdict/--explain)
 ├── diff.rs        # fingerprint extraction + probe JSON diff (diff subcommand/--since-good)
 ├── fanout.rs      # --fanout (per-IP), --all-families (v4/v6)
-├── dns.rs         # custom DNS-over-UDP client (--via multi-resolver + --ecs)
+├── dns.rs         # custom DNS-over-UDP client (--via multi-resolver compare + --dns normal-flow resolver override + --ecs)
 ├── trace.rs       # system traceroute + TLS-terminating hop annotation
 ├── chain.rs       # chain completeness/AIA repair, weakest-link expiry, handshake error decoder
 ├── record.rs      # --record/replay, --trap (freeze on first failure)

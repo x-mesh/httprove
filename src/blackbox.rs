@@ -139,6 +139,8 @@ pub fn to_probe_config(
         body: None,
         timeout,
         resolve: None,
+        dns_servers: Vec::new(),
+        ecs: None,
         ip_family,
         insecure: false,
         http_version: HttpVersionPref::Auto,

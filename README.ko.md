@@ -34,7 +34,8 @@ Total                     117.6 ms
 - **합성 모니터링** — `--expect-*` 어설션(종료 코드 3), `--warn` 임계값 강조
 - **연동** — JSON/NDJSON, Prometheus(`--prom`/`--listen`), OTLP(`--otlp`), HTML 리포트(`--report`)
 - **캡처** — `--trap`(첫 실패 동결), `--record`/`replay`(인시던트 기록·재생)
-- **운영** — keep-alive 모드, `--resolve`, 인증서 일괄 점검(`--cert-check`), 베이스라인 비교
+- **DNS 제어** — `--dns`(시스템 리졸버 대신 지정 서버로 해석), `--resolve`(DNS 우회: bare IP 또는 curl식 `host:port:addr`)
+- **운영** — keep-alive 모드, 인증서 일괄 점검(`--cert-check`), 베이스라인 비교
 - **요청 인스펙터** — `serve`로 들어오는 HTTP 요청을 콘솔에 dump(method/헤더/바디)하고 JSON으로
   에코백하는 로컬 echo 서버(httpbin/RequestBin 류). mock 응답(`--status`/`--delay`/`--respond-*`),
   NDJSON(`--json`), `GET /__requests` 보관 조회
@@ -213,6 +214,8 @@ ping 라인 스타일로 최근 결과를 한 줄씩 — 실패는 빨강으로 
 ```bash
 httprove -L https://example.com              # 리다이렉트 추적 (hop별 측정)
 httprove --resolve 10.0.0.5 https://api.example.com   # 특정 백엔드 직접 타격 (DNS 우회, SNI/Host 유지)
+httprove --resolve api.example.com:443:10.0.0.5 https://api.example.com   # curl식 host별 고정 (in-tool /etc/hosts, 반복 가능)
+httprove --dns 1.1.1.1,8.8.8.8 https://api.example.com   # 시스템 리졸버 대신 지정한 DNS 서버로 해석
 httprove -4 https://api.example.com          # IPv4 강제 (-6: IPv6)
 httprove --http1 https://api.example.com     # HTTP/1.1 강제 (h2 협상 비활성)
 httprove -k https://expired.internal         # 인증서 검증 생략 (체인 정보는 그대로 수집)
@@ -273,6 +276,7 @@ httprove --explain https://api.example.com   # "TCP 39ms, 서버 21ms(TTFB), 총
 httprove --fanout https://api.example.com          # DNS의 모든 IP를 개별 프로브, 불량 백엔드(outlier) 적발
 httprove --all-families https://api.example.com    # IPv4 vs IPv6 단계별 비교
 httprove --via 1.1.1.1,8.8.8.8 https://api.example.com   # 리졸버별 응답 IP/POP 비교 (--ecs로 client-subnet)
+httprove --dns 1.1.1.1 https://api.example.com     # 지정 리졸버로 일반 프로브 (일반 흐름; -c/--json/--verdict와 조합 가능)
 httprove trace https://api.example.com             # 시스템 traceroute + TLS 종단 hop 주석
 ```
 
@@ -337,7 +341,7 @@ src/
 ├── verdict.rs     # 건강 판정 PASS/DEGRADED/DOWN (--verdict/--explain)
 ├── diff.rs        # 지문 추출 + 프로브 JSON diff (diff 서브커맨드/--since-good)
 ├── fanout.rs      # --fanout(IP별), --all-families(v4/v6)
-├── dns.rs         # 자체 DNS-over-UDP 클라이언트 (--via 멀티 리졸버 + --ecs)
+├── dns.rs         # 자체 DNS-over-UDP 클라이언트 (--via 멀티 리졸버 비교 + --dns 일반 흐름 리졸버 교체 + --ecs)
 ├── trace.rs       # 시스템 traceroute + TLS 종단 hop 주석
 ├── chain.rs       # 체인 완결성/AIA 복구, 최약링크 만료, 핸드셰이크 에러 디코더
 ├── record.rs      # --record/replay, --trap (첫 실패 동결)

@@ -441,6 +441,31 @@ async fn connect_hop(
         match url.host() {
             Some(url::Host::Ipv4(v4)) => (vec![IpAddr::V4(v4)], None),
             Some(url::Host::Ipv6(v6)) => (vec![IpAddr::V6(v6)], None),
+            // --dns: 시스템 리졸버 대신 지정한 DNS 서버들로 해석한다. resolve_via_servers가
+            // 프로브 데드라인을 남은 서버 수로 배분해 죽은 서버가 뒤 서버를 굶기지 않게 하고,
+            // 바깥 phase_await(deadline)가 하드 캡으로 한 번 더 감싼다.
+            _ if !cfg.dns_servers.is_empty() => {
+                let dns_start = Instant::now();
+                let ips = phase_await(deadline, ErrorPhase::Dns, async {
+                    crate::dns::resolve_via_servers(
+                        &cfg.dns_servers,
+                        &host_str,
+                        cfg.ip_family,
+                        cfg.ecs.as_deref(),
+                        deadline,
+                    )
+                    .await
+                    .map_err(|e| {
+                        PhaseFail::new(
+                            ErrorPhase::Dns,
+                            format!("custom DNS resolution for {host_str:?} failed: {e}"),
+                        )
+                    })
+                })
+                .await?;
+                // resolve_via_servers가 이미 family 필터 + 비어있지 않음을 보장한다.
+                (ips, Some(elapsed_ms(dns_start)))
+            }
             _ => {
                 let dns_start = Instant::now();
                 let addrs = phase_await(deadline, ErrorPhase::Dns, async {
