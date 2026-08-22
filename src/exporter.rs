@@ -20,7 +20,7 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,16 +48,39 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// 타깃별 공유 상태: (타깃 URL, 누적 통계, 마지막 성공 결과, 최신 결과의 health 판정).
 /// 마지막 필드는 B12/B13 메트릭용 — 매 결과(성공/실패)마다 갱신한다. 타깃 순서 보존.
-type SharedState = Arc<
-    Mutex<
-        Vec<(
-            String,
-            StatsCollector,
-            Option<ProbeResult>,
-            Option<VerdictState>,
-        )>,
-    >,
->;
+struct TargetState {
+    name: String,
+    stats: StatsCollector,
+    last_success: Option<ProbeResult>,
+    verdict_state: Option<VerdictState>,
+    last_attempt_timestamp_seconds: f64,
+    last_success_timestamp_seconds: f64,
+}
+
+struct ExporterState {
+    targets: Vec<TargetState>,
+    start_time_seconds: f64,
+    metrics_requests_total: u64,
+    probe_interval_seconds: f64,
+    probe_timeout_seconds: f64,
+}
+
+type SharedState = Arc<Mutex<ExporterState>>;
+
+fn unix_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn monotonic_timestamp(previous: f64, observed: f64) -> f64 {
+    if observed.is_finite() && observed >= 0.0 {
+        previous.max(observed)
+    } else {
+        previous
+    }
+}
 
 /// exporter 모드 실행. Ctrl-C까지 블로킹.
 pub async fn run_exporter(
@@ -69,18 +92,27 @@ pub async fn run_exporter(
     // SLO는 설정값(Copy) — out_cfg가 update 태스크로 move되기 전에 추출해 accept 루프가 쓴다.
     let slo = out_cfg.slo;
     // 타깃 순서대로 상태 슬롯 초기화 (Apdex 임계 주입).
-    let state: SharedState = Arc::new(Mutex::new(
-        cfgs.iter()
-            .map(|c| {
-                (
-                    c.url.to_string(),
-                    StatsCollector::with_apdex_threshold(out_cfg.apdex_threshold),
-                    None,
-                    None,
-                )
+    let probe_timeout_seconds = cfgs
+        .first()
+        .map(|cfg| cfg.timeout.as_secs_f64())
+        .unwrap_or(0.0);
+    let state: SharedState = Arc::new(Mutex::new(ExporterState {
+        targets: cfgs
+            .iter()
+            .map(|c| TargetState {
+                name: c.url.to_string(),
+                stats: StatsCollector::with_apdex_threshold(out_cfg.apdex_threshold),
+                last_success: None,
+                verdict_state: None,
+                last_attempt_timestamp_seconds: 0.0,
+                last_success_timestamp_seconds: 0.0,
             })
             .collect(),
-    ));
+        start_time_seconds: unix_timestamp_seconds(),
+        metrics_requests_total: 0,
+        probe_interval_seconds: interval.as_secs_f64(),
+        probe_timeout_seconds,
+    }));
 
     // 바인드 실패는 즉시 에러 반환.
     let listener = TcpListener::bind(listen)
@@ -110,14 +142,20 @@ pub async fn run_exporter(
                 // Mutex poisoning은 무시하고 내부 데이터를 계속 사용한다.
                 let mut slots = update_state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(slot) = slots
+                    .targets
                     .iter_mut()
-                    .find(|(name, _, _, _)| *name == result.target)
+                    .find(|slot| slot.name == result.target)
                 {
-                    slot.1.record(&result);
+                    slot.stats.record(&result);
                     // 최신 결과(성공/실패) 기준 판정 — 실패면 Down으로 반영된다.
-                    slot.3 = Some(crate::verdict::assess(&result, &vctx).state);
+                    slot.verdict_state = Some(crate::verdict::assess(&result, &vctx).state);
+                    let now = unix_timestamp_seconds();
+                    slot.last_attempt_timestamp_seconds =
+                        monotonic_timestamp(slot.last_attempt_timestamp_seconds, now);
                     if result.is_success() {
-                        slot.2 = Some(result.clone());
+                        slot.last_success = Some(result.clone());
+                        slot.last_success_timestamp_seconds =
+                            monotonic_timestamp(slot.last_success_timestamp_seconds, now);
                     }
                 }
             } // /metrics 응답을 막지 않도록 출력 전에 락 해제.
@@ -178,21 +216,59 @@ async fn handle_connection(mut stream: TcpStream, state: SharedState, slo: Optio
 
     match route(&request_line) {
         Route::Metrics => {
-            // 락 구간 최소화: 스냅샷 렌더링까지만 잡고 즉시 해제.
-            let body = {
-                let slots = state.lock().unwrap_or_else(|e| e.into_inner());
-                let metrics: Vec<TargetMetrics<'_>> = slots
+            let (targets, exporter) = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                state.metrics_requests_total += 1;
+                let exporter = prom::ExporterMetrics {
+                    up: true,
+                    start_time_seconds: state.start_time_seconds,
+                    metrics_requests_total: state.metrics_requests_total,
+                    configured_targets: state.targets.len(),
+                    probe_interval_seconds: state.probe_interval_seconds,
+                    probe_timeout_seconds: state.probe_timeout_seconds,
+                    config_generation: 1,
+                    config_reload_supported: false,
+                    last_probe_attempt_timestamp_seconds: state
+                        .targets
+                        .iter()
+                        .map(|slot| (slot.name.clone(), slot.last_attempt_timestamp_seconds))
+                        .collect(),
+                    last_probe_success_timestamp_seconds: state
+                        .targets
+                        .iter()
+                        .map(|slot| (slot.name.clone(), slot.last_success_timestamp_seconds))
+                        .collect(),
+                };
+                let targets: Vec<(
+                    String,
+                    StatsCollector,
+                    Option<ProbeResult>,
+                    Option<VerdictState>,
+                )> = state
+                    .targets
                     .iter()
-                    .map(|(name, stats, last, vstate)| TargetMetrics {
-                        target: name,
-                        stats,
-                        last_success: last.as_ref(),
-                        verdict_state: *vstate,
-                        slo,
+                    .map(|slot| {
+                        (
+                            slot.name.clone(),
+                            slot.stats.clone(),
+                            slot.last_success.clone(),
+                            slot.verdict_state,
+                        )
                     })
                     .collect();
-                prom::render(&metrics)
+                (targets, exporter)
             };
+            let metrics: Vec<TargetMetrics<'_>> = targets
+                .iter()
+                .map(|(name, stats, last, verdict_state)| TargetMetrics {
+                    target: name,
+                    stats,
+                    last_success: last.as_ref(),
+                    verdict_state: *verdict_state,
+                    slo,
+                })
+                .collect();
+            let body = prom::render_exporter(&metrics, &exporter);
             write_response(&mut stream, "200 OK", "text/plain; version=0.0.4", &body).await;
         }
         Route::Index => {
@@ -420,4 +496,93 @@ async fn handle_probe_request(
     let result = crate::probe::probe(&cfg, 0).await;
     let body = crate::blackbox::render_blackbox(&result);
     write_response(&mut stream, "200 OK", "text/plain; version=0.0.4", &body).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> SharedState {
+        Arc::new(Mutex::new(ExporterState {
+            targets: vec![TargetState {
+                name: "http://example.test/".to_string(),
+                stats: StatsCollector::new(),
+                last_success: None,
+                verdict_state: None,
+                last_attempt_timestamp_seconds: 0.0,
+                last_success_timestamp_seconds: 0.0,
+            }],
+            start_time_seconds: 123.0,
+            metrics_requests_total: 0,
+            probe_interval_seconds: 5.0,
+            probe_timeout_seconds: 3.0,
+        }))
+    }
+
+    async fn request(state: SharedState, raw: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, state, None).await;
+        });
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(raw.as_bytes()).await.expect("write");
+        client.shutdown().await.expect("shutdown write");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read");
+        server.await.expect("server task");
+        String::from_utf8(response).expect("utf8 response")
+    }
+
+    #[test]
+    fn timestamp_updates_do_not_regress_or_accept_invalid_values() {
+        assert_eq!(monotonic_timestamp(20.0, 10.0), 20.0);
+        assert_eq!(monotonic_timestamp(20.0, 30.0), 30.0);
+        assert_eq!(monotonic_timestamp(20.0, f64::NAN), 20.0);
+        assert_eq!(monotonic_timestamp(20.0, -1.0), 20.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_exposes_exporter_state_and_increments_counter() {
+        let state = test_state();
+        let first = request(
+            Arc::clone(&state),
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(first.contains("# TYPE httprove_exporter_metrics_requests_total counter"));
+        assert!(first.contains("httprove_exporter_metrics_requests_total 1"));
+        assert!(first.contains(
+            "httprove_target_last_probe_attempt_timestamp_seconds{target=\"http://example.test/\"} 0"
+        ));
+        assert!(first.contains(
+            "httprove_target_last_probe_success_timestamp_seconds{target=\"http://example.test/\"} 0"
+        ));
+
+        let second = request(
+            Arc::clone(&state),
+            "GET /metrics?x=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(second.contains("httprove_exporter_metrics_requests_total 2"));
+    }
+
+    #[tokio::test]
+    async fn index_and_unknown_routes_keep_existing_statuses() {
+        let index = request(
+            test_state(),
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(index.starts_with("HTTP/1.1 200 OK"), "{index}");
+
+        let missing = request(
+            test_state(),
+            "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+    }
 }

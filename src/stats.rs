@@ -81,7 +81,7 @@ pub struct PhaseStats {
 /// - mean/m2: Welford 누적 (전체 샘플 기준)
 /// - min/max: 누적 전체 기준
 /// - recent: 백분위 계산용 최근 샘플 링 버퍼 (cap = RING_CAP)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PhaseAccum {
     count: u64,
     mean: f64,
@@ -146,7 +146,7 @@ impl PhaseAccum {
 }
 
 /// 프로브 결과 수집기. CLI ping 모드와 TUI가 공용으로 사용한다.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StatsCollector {
     sent: u64,
     succeeded: u64,

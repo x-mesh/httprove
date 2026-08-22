@@ -85,6 +85,47 @@
   "panels": [
     {
       "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 107,
+      "panels": [],
+      "title": "Exporter Freshness",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Exporter process state. Missing data is distinct from a zero value.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 1},
+      "id": 19,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "httprove_exporter_up", "legendFormat": "exporter", "range": true, "refId": "A"}],
+      "title": "Exporter Up",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Seconds since the latest probe attempt for the selected target.",
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 8, "x": 8, "y": 1},
+      "id": 20,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "httprove:target_last_probe_attempt_age_seconds{target=~\"$target\"}", "legendFormat": "{{target}}", "range": true, "refId": "A"}],
+      "title": "Last Probe Attempt Age",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Seconds since the latest successful probe. No value before the first success.",
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 1},
+      "id": 21,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "httprove:target_last_probe_success_age_seconds{target=~\"$target\"}", "legendFormat": "{{target}}", "range": true, "refId": "A"}],
+      "title": "Last Probe Success Age",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "id": 100,
       "panels": [],
@@ -176,7 +217,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Mean availability across the fleet over the last 5m. Recording rule: httprove:probe_availability:ratio_rate5m = 1 - rate(httprove_probe_failures_total[5m]) / rate(httprove_probes_total[5m]).",
+      "description": "Mean availability across the fleet over the last 5m. Recording rule: httprove:availability:ratio5m.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -210,7 +251,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "avg(httprove:probe_availability:ratio_rate5m)",
+          "expr": "avg(httprove:availability:ratio5m)",
           "legendFormat": "availability",
           "range": true,
           "refId": "A"
@@ -221,7 +262,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Mean Apdex across the fleet. Recording rule: httprove:apdex:ratio_rate5m = (rate(httprove_apdex_satisfied_total[5m]) + rate(httprove_apdex_tolerating_total[5m]) / 2) / rate(httprove_probes_total[5m]). Requires --apdex-threshold set on the targets.",
+      "description": "Mean Apdex across the fleet. Recording rule: httprove:apdex:ratio5m. Requires --apdex-threshold set on the targets.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -255,7 +296,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "avg(httprove:apdex:ratio_rate5m)",
+          "expr": "avg(httprove:apdex:ratio5m)",
           "legendFormat": "apdex",
           "range": true,
           "refId": "A"
@@ -995,7 +1036,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Error-budget burn rate per target. Recording rule: httprove:slo_burn_rate:ratio1h = (rate(httprove_probe_failures_total[1h]) / rate(httprove_probes_total[1h])) / (1 - httprove_slo_target_ratio). Above 1 burns budget faster than the SLO allows; red above 14.4 (fast burn).",
+      "description": "Error-budget burn rate per target. Recording rule: httprove:slo_burn_rate:1h. Above 1 burns budget faster than the SLO allows; red above 14.4 (fast burn).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1042,7 +1083,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "httprove:slo_burn_rate:ratio1h{target=~\"$target\"}",
+          "expr": "httprove:slo_burn_rate:1h{target=~\"$target\"}",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1053,7 +1094,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Remaining error budget for the selected target. Recording rule: httprove:error_budget_remaining:ratio = 1 - ((1 - httprove:probe_availability:ratio_rate5m) / (1 - httprove_slo_target_ratio)). 1 = full budget, 0 = exhausted.",
+      "description": "Remaining 28-day error budget for the selected target. Recording rule: httprove:error_budget_remaining:28d. 1 = full budget, 0 = exhausted.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1088,7 +1129,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "httprove:error_budget_remaining:ratio{target=~\"$target\"}",
+          "expr": "httprove:error_budget_remaining:28d{target=~\"$target\"}",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1149,4 +1190,3 @@
   "version": 1,
   "weekStart": ""
 }
-

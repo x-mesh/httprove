@@ -8,9 +8,9 @@ recording 룰·alert 룰·대시보드입니다. httprove는 **무상태 스냅�
 
 | 파일 | 내용 |
 |---|---|
-| `prometheus-recording-rules.yml` | availability · strict-availability · Apdex · SLO burn-rate(5m/30m/1h/6h) · error-budget(28d) · TTFB p95 z-score — 9개 룰 |
-| `prometheus-alerts.yml` | TargetDown · FleetTargetsDown · CertExpiringSoon/Expired · CertChainIncomplete · TLSDowngrade · SLOFastBurn/SlowBurn · ApdexDegraded · LatencyAnomaly · DNSAnswerChanged — 11개 알림 |
-| `grafana-dashboard.json` | Fleet / Latency / TLS·Cert / Verdict / Connection / DNS / SLO — 8행 25패널 (schemaVersion 39, datasource 변수 `${DS_PROMETHEUS}`) |
+| `prometheus-recording-rules.yml` | freshness age · availability · Apdex · SLO burn-rate · error-budget · TTFB z-score |
+| `prometheus-alerts.yml` | exporter/probe freshness · target health · TLS · SLO · latency · DNS 알림 |
+| `grafana-dashboard.json` | Exporter Freshness / Fleet / Latency / TLS·Cert / Verdict / Connection / DNS / SLO |
 
 ## 사용
 
@@ -35,6 +35,44 @@ recording 룰·alert 룰·대시보드입니다. httprove는 **무상태 스냅�
    ```
 
 3. Grafana에서 `grafana-dashboard.json`을 Import하고 Prometheus datasource를 선택합니다.
+
+## 운영 runbook
+
+1. **Exporter missing**: `HttproveExporterMissing`이면 target 장애를 보기 전에 exporter process,
+   Prometheus scrape target과 네트워크 경로를 확인한다.
+2. **Probe loop stalled**: `httprove_exporter_up`은 있지만 `HttproveProbeLoopStalled`이면
+   `Last Probe Attempt Age`가 `2 × interval + timeout`을 넘었는지 확인한다.
+3. **Never succeeded**: attempt timestamp가 `0`보다 크고 success timestamp가 `0`이면 첫 성공이
+   아직 없다. 최근 probe error와 TLS/DNS 설정을 확인한다.
+4. **Stale success**: attempt는 갱신되지만 success age만 커지면 probe loop는 돌고 있으나 계속
+   실패하는 상태다. `TargetDown`과 단계별 latency/error를 함께 본다.
+
+`httprove_exporter_config_generation`은 `1`, `httprove_exporter_config_reload_supported`는 `0`이다.
+runtime reload는 지원하지 않으므로 설정 변경 후 exporter를 재시작한다. timestamp `0`은 no-data
+sentinel이고 실제 Unix epoch로 해석하지 않는다.
+
+## Redirect 진단
+
+```bash
+httprove -L --redirect-diagnostics https://example.com
+```
+
+완료된 hop이 둘 이상이면 hop별 status, 전체 redirect 시간 기여도, dominant phase, origin 전환과
+connection reuse를 text로 표시한다. 추가 요청을 보내지 않고 관측된 값만 설명한다. 중간 hop에서
+실패하면 완료된 hop까지만 진단하며 원인을 단정하지 않는다. 기본값은 비활성이고 `--json`, TUI,
+exporter, cert-check와 함께 사용할 수 없으므로 기존 NDJSON·Prometheus 계약과 exit code는 변하지 않는다.
+
+## 호환성과 rollback
+
+| 표면 | 변경 | 비활성화·rollback |
+|---|---|---|
+| CLI/NDJSON/exit code | 기존 계약 유지, opt-in flag만 추가 | `--redirect-diagnostics`를 생략 |
+| Prometheus exporter | exporter-only family 추가 | 새 alert를 먼저 비활성화 |
+| rules/dashboard | freshness rule·alert·panel 추가 | 새 panel과 recording rule 제거 |
+| binary | persistent state·migration 없음 | 필요하면 이전 binary로 복귀 |
+
+기본 gate는 `make fmt-check`, `make lint`, `make test`, `make release`다. `make smoke`는 외부
+네트워크를 사용하고 `promtool check rules`는 설치가 필요한 도구이므로 둘 다 선택 검증으로 남긴다.
 
 ## 설계 메모
 

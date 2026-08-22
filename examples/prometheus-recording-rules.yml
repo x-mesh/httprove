@@ -37,6 +37,16 @@
 groups:
   - name: httprove
     rules:
+      # Freshness is derived from raw event timestamps. The exporter keeps no
+      # time window; Prometheus owns the clock and clamps clock skew to zero.
+      - record: httprove:target_last_probe_attempt_age_seconds
+        expr: |
+          clamp_min(time() - httprove_target_last_probe_attempt_timestamp_seconds, 0)
+
+      - record: httprove:target_last_probe_success_age_seconds
+        expr: |
+          clamp_min(time() - httprove_target_last_probe_success_timestamp_seconds, 0)
+
       # ----------------------------------------------------------------------
       # Availability — fraction of probes that did NOT fail at the network level.
       # Restores availability from probes_total (sent) and probe_failures_total
@@ -155,6 +165,18 @@ groups:
             1 - httprove_slo_target_ratio
           )
 
+      - record: httprove:slo_burn_rate:3d
+        expr: |
+          (
+            rate(httprove_probe_failures_total[3d])
+              /
+            rate(httprove_probes_total[3d])
+          )
+            / on(target) group_left()
+          (
+            1 - httprove_slo_target_ratio
+          )
+
       # ----------------------------------------------------------------------
       # Error budget remaining (28-day rolling) — fraction of the allowed error
       # budget still unspent.
@@ -203,4 +225,3 @@ groups:
           )
             /
           stddev_over_time(httprove_phase_milliseconds{phase="ttfb",stat="p95"}[1h])
-

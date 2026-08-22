@@ -59,6 +59,22 @@ pub struct TargetMetrics<'a> {
     pub slo: Option<f64>,
 }
 
+/// Exporter-owned bounded state, rendered separately from the established
+/// per-target snapshot metric families.
+#[derive(Debug, Clone)]
+pub struct ExporterMetrics {
+    pub up: bool,
+    pub start_time_seconds: f64,
+    pub metrics_requests_total: u64,
+    pub configured_targets: usize,
+    pub probe_interval_seconds: f64,
+    pub probe_timeout_seconds: f64,
+    pub config_generation: u64,
+    pub config_reload_supported: bool,
+    pub last_probe_attempt_timestamp_seconds: Vec<(String, f64)>,
+    pub last_probe_success_timestamp_seconds: Vec<(String, f64)>,
+}
+
 /// phase 게이지의 stat 레이블 출력 순서.
 const STAT_ORDER: [&str; 7] = ["min", "mean", "stddev", "p50", "p95", "p99", "max"];
 
@@ -665,6 +681,98 @@ pub fn render(targets: &[TargetMetrics<'_>]) -> String {
         &slo_lines,
     );
 
+    out
+}
+
+/// Render exporter self-metrics followed by the established target snapshot.
+/// Keeping this boundary additive leaves `render` and its legacy contract intact.
+pub fn render_exporter(targets: &[TargetMetrics<'_>], exporter: &ExporterMetrics) -> String {
+    let mut out = String::new();
+    let scalars = [
+        (
+            "httprove_exporter_up",
+            "Whether the exporter is serving metrics (1=yes).",
+            u8::from(exporter.up) as f64,
+        ),
+        (
+            "httprove_exporter_start_time_seconds",
+            "Unix timestamp when the exporter started.",
+            exporter.start_time_seconds,
+        ),
+        (
+            "httprove_exporter_configured_targets",
+            "Number of configured probe targets.",
+            exporter.configured_targets as f64,
+        ),
+        (
+            "httprove_exporter_probe_interval_seconds",
+            "Configured probe interval in seconds.",
+            exporter.probe_interval_seconds,
+        ),
+        (
+            "httprove_exporter_probe_timeout_seconds",
+            "Configured probe timeout in seconds.",
+            exporter.probe_timeout_seconds,
+        ),
+        (
+            "httprove_exporter_config_generation",
+            "Static exporter configuration generation.",
+            exporter.config_generation as f64,
+        ),
+        (
+            "httprove_exporter_config_reload_supported",
+            "Whether runtime configuration reload is supported.",
+            u8::from(exporter.config_reload_supported) as f64,
+        ),
+    ];
+    for (name, help, value) in scalars {
+        push_section(&mut out, name, help, "gauge", &[format!("{name} {value}")]);
+    }
+    push_section(
+        &mut out,
+        "httprove_exporter_metrics_requests_total",
+        "Total /metrics requests served.",
+        "counter",
+        &[format!(
+            "httprove_exporter_metrics_requests_total {}",
+            exporter.metrics_requests_total
+        )],
+    );
+    let attempts: Vec<_> = exporter
+        .last_probe_attempt_timestamp_seconds
+        .iter()
+        .map(|(target, value)| {
+            format!(
+                "httprove_target_last_probe_attempt_timestamp_seconds{{target=\"{}\"}} {value}",
+                escape_label(target)
+            )
+        })
+        .collect();
+    push_section(
+        &mut out,
+        "httprove_target_last_probe_attempt_timestamp_seconds",
+        "Unix timestamp of the latest probe attempt; 0 before the first attempt.",
+        "gauge",
+        &attempts,
+    );
+    let successes: Vec<_> = exporter
+        .last_probe_success_timestamp_seconds
+        .iter()
+        .map(|(target, value)| {
+            format!(
+                "httprove_target_last_probe_success_timestamp_seconds{{target=\"{}\"}} {value}",
+                escape_label(target)
+            )
+        })
+        .collect();
+    push_section(
+        &mut out,
+        "httprove_target_last_probe_success_timestamp_seconds",
+        "Unix timestamp of the latest successful probe; 0 before the first success.",
+        "gauge",
+        &successes,
+    );
+    out.push_str(&render(targets));
     out
 }
 
@@ -1447,5 +1555,43 @@ mod tests {
             slo: None,
         }];
         assert!(!render(&tm2).contains("httprove_slo_target_ratio"));
+    }
+
+    #[test]
+    fn exporter_metrics_are_additive_and_keep_snapshot_render_unchanged() {
+        let stats = StatsCollector::new();
+        let targets = [TargetMetrics {
+            target: "https://example.com/",
+            stats: &stats,
+            last_success: None,
+            verdict_state: None,
+            slo: None,
+        }];
+        let snapshot = render(&targets);
+        assert!(!snapshot.contains("httprove_exporter_"));
+        assert!(!snapshot.contains("httprove_target_last_probe_"));
+
+        let exporter = ExporterMetrics {
+            up: true,
+            start_time_seconds: 100.0,
+            metrics_requests_total: 2,
+            configured_targets: 1,
+            probe_interval_seconds: 5.0,
+            probe_timeout_seconds: 3.0,
+            config_generation: 1,
+            config_reload_supported: false,
+            last_probe_attempt_timestamp_seconds: vec![("https://example.com/".to_string(), 110.0)],
+            last_probe_success_timestamp_seconds: vec![("https://example.com/".to_string(), 105.0)],
+        };
+        let text = render_exporter(&targets, &exporter);
+        assert!(text.ends_with(&snapshot));
+        assert!(text.contains("# TYPE httprove_exporter_metrics_requests_total counter"));
+        assert!(text.contains("httprove_exporter_config_reload_supported 0"));
+        assert!(text.contains(
+            r#"httprove_target_last_probe_attempt_timestamp_seconds{target="https://example.com/"} 110"#
+        ));
+        assert!(text.contains(
+            r#"httprove_target_last_probe_success_timestamp_seconds{target="https://example.com/"} 105"#
+        ));
     }
 }

@@ -79,6 +79,62 @@
 groups:
   - name: httprove-alerts
     rules:
+      # ── Exporter / probe freshness ──────────────────────────────────────────
+      - alert: HttproveExporterMissing
+        expr: absent_over_time(httprove_exporter_up[5m])
+        labels:
+          severity: critical
+        annotations:
+          summary: "httprove exporter metrics are missing"
+          description: >-
+            Prometheus has not seen httprove_exporter_up for 5 minutes. Check the
+            exporter process, scrape target, and network path before target health.
+
+      - alert: HttproveProbeLoopStalled
+        expr: |
+          httprove_target_last_probe_attempt_timestamp_seconds > 0
+          and on(target)
+          httprove:target_last_probe_attempt_age_seconds
+            > on() group_left()
+              (2 * httprove_exporter_probe_interval_seconds + httprove_exporter_probe_timeout_seconds)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Probe loop stalled for {{ $labels.target }}"
+          description: >-
+            The last probe attempt is older than two configured intervals plus
+            the probe timeout. The exporter is still being scraped.
+
+      - alert: HttproveTargetNeverSucceeded
+        expr: |
+          httprove_target_last_probe_attempt_timestamp_seconds > 0
+          and on(target) httprove_target_last_probe_success_timestamp_seconds == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} has never completed a successful probe"
+          description: >-
+            At least one attempt was recorded, but the success timestamp remains
+            the documented zero sentinel. Inspect the latest target error.
+
+      - alert: HttproveTargetSuccessStale
+        expr: |
+          httprove_target_last_probe_success_timestamp_seconds > 0
+          and on(target)
+          httprove:target_last_probe_success_age_seconds
+            > on() group_left()
+              (6 * httprove_exporter_probe_interval_seconds + httprove_exporter_probe_timeout_seconds)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last successful probe is stale for {{ $labels.target }}"
+          description: >-
+            Probe attempts may still be running, but no success has been observed
+            within six configured intervals plus the timeout.
+
       # ── Availability ────────────────────────────────────────────────────────
       - alert: TargetDown
         expr: httprove_target_up == 0
@@ -235,4 +291,3 @@ groups:
             (increase(httprove_dns_answer_changed_total[10m]) > 0). This may be a
             routine DNS rotation/failover, or an unexpected record change —
             verify it was intended.
-

@@ -56,6 +56,11 @@ pub struct Args {
     #[arg(short = 'L', long, conflicts_with = "keepalive")]
     pub follow: bool,
 
+    /// Explain per-hop redirect timing when following redirects (text output only)
+    #[arg(long = "redirect-diagnostics", requires = "follow",
+          conflicts_with_all = ["json", "tui", "prom", "listen", "cert_check"]) ]
+    pub redirect_diagnostics: bool,
+
     /// Maximum redirects to follow (with -L)
     #[arg(long, default_value_t = 10, value_name = "N")]
     pub max_redirects: u32,

@@ -281,6 +281,7 @@ async fn run(args: Args, color: bool) -> anyhow::Result<ExitCode> {
         show_target: cfgs.len() > 1,
         slo: args.slo,
         apdex_threshold: args.apdex_threshold,
+        redirect_diagnostics: args.redirect_diagnostics,
     };
 
     // exporter 모드: 무한 프로브 + /metrics HTTP 서버.

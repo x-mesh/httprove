@@ -25,4 +25,6 @@ pub struct OutputConfig {
     pub slo: Option<f64>,
     /// Apdex 만족 임계 T(ms). Some이면 StatsCollector가 satisfied/tolerating을 집계. B3.
     pub apdex_threshold: Option<f64>,
+    /// Print additive redirect-hop diagnostics in text output only.
+    pub redirect_diagnostics: bool,
 }

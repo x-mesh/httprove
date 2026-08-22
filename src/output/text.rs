@@ -143,6 +143,9 @@ pub fn print_single(result: &ProbeResult, cfg: &OutputConfig) {
             for hop in &result.hops {
                 print_hop_line(hop, cfg);
             }
+            if cfg.redirect_diagnostics {
+                print_redirect_diagnostics(result);
+            }
         }
         return;
     }
@@ -210,6 +213,9 @@ pub fn print_single(result: &ProbeResult, cfg: &OutputConfig) {
         for hop in &result.hops {
             print_hop_line(hop, cfg);
         }
+        if cfg.redirect_diagnostics {
+            print_redirect_diagnostics(result);
+        }
     }
 
     println!();
@@ -250,6 +256,111 @@ pub fn print_single(result: &ProbeResult, cfg: &OutputConfig) {
             println!("  {k}: {v}");
         }
     }
+}
+
+/// Additive redirect-chain investigation hints. This uses only recorded hops and
+/// deliberately describes observations rather than assigning a root cause.
+fn print_redirect_diagnostics(result: &ProbeResult) {
+    let lines = redirect_diagnostics_lines(result);
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    println!("redirect diagnostics:");
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+fn redirect_diagnostics_lines(result: &ProbeResult) -> Vec<String> {
+    if result.hops.len() < 2 {
+        return Vec::new();
+    }
+    let total: f64 = result
+        .hops
+        .iter()
+        .map(|hop| hop.timings.total_ms.max(0.0))
+        .sum();
+    result
+        .hops
+        .iter()
+        .enumerate()
+        .map(|(index, hop)| {
+        let previous_origin = index
+            .checked_sub(1)
+            .and_then(|i| origin(&result.hops[i].url));
+        let current_origin = origin(&hop.url);
+        let origin_note = match (previous_origin, current_origin) {
+            (Some(previous), Some(current)) if previous != current => "; origin changed",
+            _ => "",
+        };
+        let reuse_note = if hop.reused_conn {
+            "; connection reused"
+        } else {
+            ""
+        };
+        let (phase, duration, hint) = dominant_phase(hop);
+        let contribution = if total > 0.0 {
+            hop.timings.total_ms.max(0.0) / total * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "  hop {}: status {}{origin_note}{reuse_note}; {:.1}% of redirect time; dominant {} {:.1} ms — {}",
+            index + 1,
+            hop.status,
+            contribution,
+            phase,
+            duration,
+            hint
+        )
+        })
+        .collect()
+}
+
+fn origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme(),
+        url.host_str()?,
+        url.port_or_known_default()?
+    ))
+}
+
+fn dominant_phase(hop: &HopResult) -> (&'static str, f64, &'static str) {
+    let mut candidates = vec![
+        (
+            "tcp",
+            hop.timings.tcp_ms,
+            "compare network path and connection establishment",
+        ),
+        (
+            "ttfb",
+            hop.timings.ttfb_ms,
+            "inspect upstream and application response timing",
+        ),
+        (
+            "download",
+            hop.timings.download_ms,
+            "inspect response size and transfer path",
+        ),
+    ];
+    if let Some(dns) = hop.timings.dns_ms {
+        candidates.push(("dns", dns, "inspect resolver and name lookup timing"));
+    }
+    if let Some(tls) = hop.timings.tls_ms {
+        candidates.push(("tls", tls, "inspect TLS negotiation and certificate path"));
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, value, _)| value.is_finite())
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((
+            "total",
+            hop.timings.total_ms,
+            "inspect this hop with a focused probe",
+        ))
 }
 
 /// hop 한 줄: status, URL, (리다이렉트 시) 다음 URL, hop별 total.
@@ -671,4 +782,113 @@ fn extract_cn(dn: &str) -> String {
         .find_map(|part| part.strip_prefix("CN="))
         .unwrap_or(dn)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::types::{ErrorPhase, PhaseTimings, ProbeError};
+
+    fn hop(url: &str, status: u16, timings: PhaseTimings, reused_conn: bool) -> HopResult {
+        HopResult {
+            url: url.to_string(),
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 80,
+            reused_conn,
+            local_addr: None,
+            resolved_ips: vec![],
+            http_version: "HTTP/1.1".to_string(),
+            status,
+            timings,
+            tls: None,
+            cert_chain: vec![],
+            response_headers: vec![],
+            body_bytes: 0,
+            redirect_to: None,
+        }
+    }
+
+    #[test]
+    fn redirect_diagnostics_identify_origin_reuse_and_dominant_phase() {
+        let result = ProbeResult {
+            target: "http://a.test/start".to_string(),
+            seq: 0,
+            timestamp: Utc::now(),
+            hops: vec![
+                hop(
+                    "http://a.test/start",
+                    302,
+                    PhaseTimings {
+                        dns_ms: Some(9.0),
+                        tcp_ms: 2.0,
+                        tls_ms: None,
+                        ttfb_ms: 3.0,
+                        download_ms: 1.0,
+                        total_ms: 15.0,
+                    },
+                    false,
+                ),
+                hop(
+                    "https://b.test/final",
+                    200,
+                    PhaseTimings {
+                        dns_ms: None,
+                        tcp_ms: 0.0,
+                        tls_ms: None,
+                        ttfb_ms: 20.0,
+                        download_ms: 2.0,
+                        total_ms: 22.0,
+                    },
+                    true,
+                ),
+            ],
+            error: None,
+            expect_failures: vec![],
+            total_ms: 37.0,
+        };
+
+        let lines = redirect_diagnostics_lines(&result);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("dominant dns 9.0 ms"), "{:?}", lines);
+        assert!(lines[1].contains("origin changed"), "{:?}", lines);
+        assert!(lines[1].contains("connection reused"), "{:?}", lines);
+        assert!(lines[1].contains("dominant ttfb 20.0 ms"), "{:?}", lines);
+    }
+
+    #[test]
+    fn redirect_diagnostics_handle_single_and_partial_chains() {
+        let mut result = ProbeResult {
+            target: "http://a.test/start".to_string(),
+            seq: 0,
+            timestamp: Utc::now(),
+            hops: vec![hop(
+                "http://a.test/start",
+                302,
+                PhaseTimings::default(),
+                false,
+            )],
+            error: None,
+            expect_failures: vec![],
+            total_ms: 0.0,
+        };
+        assert!(redirect_diagnostics_lines(&result).is_empty());
+
+        result.hops.push(hop(
+            "http://a.test/next",
+            302,
+            PhaseTimings::default(),
+            false,
+        ));
+        result.error = Some(ProbeError {
+            phase: ErrorPhase::Redirect,
+            message: "invalid location".to_string(),
+            timed_out: false,
+            hint: None,
+        });
+        assert_eq!(redirect_diagnostics_lines(&result).len(), 2);
+    }
 }

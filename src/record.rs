@@ -120,6 +120,7 @@ pub fn run_replay(path: &str, color: bool) -> ExitCode {
         show_target,
         slo: None,
         apdex_threshold: None,
+        redirect_diagnostics: false,
     };
 
     // 여러 결과면 블록 사이에 빈 줄을 넣어 가독성을 확보한다.
