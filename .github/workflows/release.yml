@@ -183,8 +183,12 @@ jobs:
             # 단축 명령 hpr 를 같은 바이너리로 노출.
             binary "httprove", target: "hpr"
 
-            postflight do
-              system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/httprove"]
+            postflight_steps do
+              on_macos do
+                run "/usr/bin/xattr",
+                    args:         ["-dr", "com.apple.quarantine", "{{staged_path}}/httprove"],
+                    must_succeed: false
+              end
             end
 
             caveats <<~CAVEAT
